@@ -16,6 +16,10 @@ Microfloats = "31c70f10-a750-4521-b13c-797315ae2933"
 IRONDLFP8TypesExt = "DLFP8Types"
 IRONMicrofloatsExt = "Microfloats"
 
+[sources]
+IRStructurizer = {url = "https://github.com/simeonschaub/IRStructurizer.jl", rev = "fix-returnnode-operands"}
+MLIR = {url = "https://github.com/simeonschaub/MLIR.jl", rev = "fix-mark-donate-and-text-printing"}
+
 [compat]
 DLFP8Types = "0.1"
 IRStructurizer = "0.6"
