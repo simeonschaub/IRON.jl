@@ -29,8 +29,8 @@
 # says it -- IRON's own Vec rather than SIMD.jl's, whose element type must come
 # from a fixed list that BFloat16 is not on.
 #
-# Run with the MLIR-AIE ironenv python so the compile/run half can find `aie`:
-#   JULIA_PYTHONCALL_EXE=/path/to/mlir-aie/ironenv/bin/python julia --project examples/matmul_vectorized.jl
+# Compiling and running need the AIE toolchain JLLs and an NPU -- but no Python:
+#   julia --project examples/matmul_vectorized.jl
 
 using IRON
 using BFloat16s: BFloat16
@@ -135,7 +135,7 @@ function run_case(::Type{Tin}, ::Type{Tacc}) where {Tin, Tacc}
     b = operand(Tin, Tacc, (i, j) -> (i - 2j) % 5)
 
     compiled = IRON.compile(
-        matmul_program(matmul_vec!, Tin, Tacc); aiecc_flags = AIECC_FLAGS
+        matmul_program(matmul_vec!, Tin, Tacc); flags = AIECC_FLAGS
     )
     dc = NPUArray{Tacc}(undef, Tile{Tacc, Tuple{tile_size(Tacc), tile_size(Tacc)}})
     IRON.run!(compiled, NPUArray(a), NPUArray(b), dc)

@@ -37,9 +37,15 @@ module IRON
 using MLIR: IR, API
 using MLIR.Dialects: arith, scf, memref, vector
 using IRStructurizer
-using PythonCall
 using Adapt: Adapt, adapt
 using GPUArraysCore: GPUArraysCore, AbstractGPUArray, @allowscalar
+
+# The AIE toolchain, shipped as JLL artifacts. `using` these never fails when an
+# artifact is missing -- only *calling* a product (aiecc, the shim library) does,
+# which is what compiling and running a design need but generating MLIR does not.
+using Peano_jll: Peano_jll
+using mlir_aie_jll: aiecc
+using ironxrt_jll: libironxrt
 
 const CC = Core.Compiler
 
@@ -52,6 +58,7 @@ include("compiler/mlir/aie.jl")
 include("compiler/mlir/dataflow.jl")
 include("compiler/interpreter.jl")
 include("compiler/compiler.jl")
+include("compiler/aiecc.jl")
 
 include("array.jl")
 include("runtime.jl")

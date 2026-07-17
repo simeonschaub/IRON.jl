@@ -47,27 +47,27 @@ the Python IRON vector-increment example, and produces the module in
 ## Running on hardware
 
 Generating MLIR needs nothing but Julia. Compiling and running additionally need
-the MLIR-AIE toolchain, an NPU and XRT, all of which are reached through the
-Python stack via PythonCall -- there is nothing to gain from reimplementing
-`aiecc` or XRT buffer management in Julia. Point PythonCall at the ironenv
-interpreter before loading IRON:
+the MLIR-AIE toolchain, an NPU and XRT -- but no Python. The toolchain is shipped
+as JLL artifacts and driven directly: `mlir_aie_jll` and `Peano_jll` provide the
+`aiecc` compile driver and the AIE LLVM backend, and `ironxrt_jll` (a small C
+shim over XRT's C++ runtime, built from `Yggdrasil/I/ironxrt`) drives the device.
+Nothing to set up beyond having those installed:
 
 ```julia
-ENV["JULIA_PYTHONCALL_EXE"] = "/path/to/mlir-aie/ironenv/bin/python"
 using IRON
 
-compiled = IRON.compile(program)     # writes .mlir, hands it to aiecc
+compiled = IRON.compile(program)     # writes .mlir, runs aiecc -> xclbin + insts
 a = NPUArray(Int32.(0:1023))         # NPU-resident XRT buffers
 b = NPUArray{Int32}(undef, Buf)
 IRON.run!(compiled, a, b)
 Array(b) == Int32.(1:1024)           # copy the result back to the host
 ```
 
-Keyword arguments to `compile` are forwarded to `aie.iron.jit`. One of them is
+`compile` takes a `flags` keyword passed straight through to `aiecc`. One is
 worth knowing about before it costs you a day:
 
 ```julia
-compiled = IRON.compile(program; aiecc_flags = ["--alloc-scheme=basic-sequential"])
+compiled = IRON.compile(program; flags = ["--alloc-scheme=basic-sequential"])
 ```
 
 Buffer allocation defaults to bank-aware, falling back to basic-sequential only

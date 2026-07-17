@@ -15,8 +15,8 @@
 # integer one returns the right answer. So this example runs the integer design,
 # which is verified on hardware, and prints the MLIR for the rest.
 #
-# Run with the MLIR-AIE ironenv python so the compile/run half can find `aie`:
-#   JULIA_PYTHONCALL_EXE=/path/to/mlir-aie/ironenv/bin/python julia --project examples/matmul.jl
+# Compiling and running need the AIE toolchain JLLs and an NPU -- but no Python:
+#   julia --project examples/matmul.jl
 
 using IRON
 using BFloat16s: BFloat16
@@ -99,7 +99,7 @@ if get(ENV, "IRON_RUN", "0") == "1"
     # Needs an NPU, XRT and the MLIR-AIE toolchain.
     T = Int32
     program = matmul_program(matmul!, square(T), square(T), square(T))
-    compiled = IRON.compile(program; aiecc_flags = AIECC_FLAGS)
+    compiled = IRON.compile(program; flags = AIECC_FLAGS)
 
     # Asymmetric, and neither one the identity, so a transposed tile or a swapped
     # pair of operands changes the answer. A symmetric `a` with `b = I` is a trap:
