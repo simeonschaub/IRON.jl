@@ -85,10 +85,12 @@ end
 Copy Julia array `A` into an NPU-resident XRT buffer.
 """
 function device_array(A::AbstractArray{T}) where {T}
-    # `iron.tensor` rejects a `dtype` kwarg that disagrees with a typed array, so
-    # the dtype is fixed here, on the numpy side, and not passed again.
-    host = np().array(collect(A); dtype = numpy_dtype(T))
-    return iron().tensor(host; device = "npu")
+    # `dtype` has to be passed even though the array already carries it: the tensor
+    # constructor defaults to uint32 and sizes the XRT buffer from the kwarg rather
+    # than from the data, then fails copying into the mistyped buffer.
+    dtype = numpy_dtype(T)
+    host = np().array(collect(A); dtype)
+    return iron().tensor(host; dtype, device = "npu")
 end
 
 """
