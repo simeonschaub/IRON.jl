@@ -41,11 +41,12 @@ using PythonCall
 
 const CC = Core.Compiler
 
+include("device/intrinsics.jl")
 include("device/tile.jl")
 include("device/vec.jl")
 
 include("compiler/mlir/utils.jl")
-include("compiler/mlir/dialects.jl")
+include("compiler/mlir/aie.jl")
 include("compiler/mlir/dataflow.jl")
 include("compiler/interpreter.jl")
 include("compiler/compiler.jl")
