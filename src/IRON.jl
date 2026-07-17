@@ -44,14 +44,14 @@ const CC = Core.Compiler
 include("context.jl")
 include("interpreter.jl")
 include("tile.jl")
-include("simd.jl")
+include("vec.jl")
 include("dialects.jl")
 include("kernel.jl")
 include("design.jl")
 include("runtime.jl")
 
-export Tile
-export vload, vstore!
+export Tile, Vec
+export vload, vstore!, vbroadcast, vconvert
 export AIEDevice, npu1, npu2
 export ObjectFifo, Endpoint, producer, consumer
 export Worker, Runtime, start!, drain!, Program

@@ -149,30 +149,45 @@ the standard `vector` dialect; nothing here emits `aievec` directly:
 vector.fma  ->  aievec.mac_elem  ->  the MAC intrinsic aie::mmul uses
 ```
 
-A kernel says that with `SIMD.Vec{N,T}` (`examples/matmul_vectorized.jl`):
+A kernel says that with `Vec{N,T}` (`examples/matmul_vectorized.jl`):
 
 ```julia
 for i in 1:M
-    acc = zero(Vec{N,T})                                     # stays in a register
+    acc = zero(Vec{N,Float32})                       # stays in a vector register
     for k in 1:K
-        acc = muladd(Vec{N,T}(a[i,k]),                       # vector.broadcast
-                     vload(Vec{N,T}, b, k, 1), acc)          # vector.load + vector.fma
+        av = Vec{N,BFloat16}(a[i,k])                 # vector.broadcast
+        bv = vload(Vec{N,BFloat16}, b, k, 1)         # vector.load
+        acc = muladd(Vec{N,Float32}(av),             # arith.extf, per vector
+                     Vec{N,Float32}(bv), acc)        # then vector.fma
     end
-    vstore!(acc, c, i, 1)                                    # vector.store
+    vstore!(acc, c, i, 1)                            # vector.store
 end
 ```
 
-**The vector width is the hardware's, not the matrix's.** `convert-vector-to-aievec`
-lowers `vector.fma` only for f32 at 16 lanes, and bf16 at 16 or 32 -- AIE2's vector
-registers are 512 bits. A `vector<8xf32>` matches no pattern, and aiecc stops with
-`failed to legalize operation 'vector.fma'`. `vector.fma` is also floating-point
-only, so an integer multiply-accumulate lowers to `arith.muli` + `arith.addi` over
-vectors instead.
+Two rules shape that, and both fail loudly rather than silently, which is a
+welcome change:
 
-SIMD.jl's arithmetic would normally inline to `llvmcall` carrying a literal LLVM IR
-string, which means nothing here, so the overlay method table redirects the
-operators to intrinsics before that happens -- the same mechanism as the FP8
-conversions.
+**The vector width is the hardware's, not the algorithm's.** `vector.fma` lowers
+only for f32 at 16 lanes, and bf16 at 16 or 32 -- AIE2's vector registers are 512
+bits. A `vector<8xf32>` matches no pattern and aiecc stops with `failed to
+legalize operation 'vector.fma'`.
+
+**An f32 `vector.fma` lowers only when both operands come from an `arith.extf` on
+bf16.** The MAC multiplies bf16 and accumulates into f32; there is no f32
+multiplier on the core, vector or scalar. This is the same fact `_MM_COMBOS`
+states as `(bfloat16, float32)`, enforced at the instruction level. So the
+operands are bf16 and the accumulator is f32, and `Vec{N,Float32}(av)` is the
+`arith.extf` that makes the multiply legal.
+
+`vector.fma` is floating-point only, so an integer multiply-accumulate lowers to
+`arith.muli` + `arith.addi` over vectors instead, which need no widening.
+
+`Vec` is IRON's own rather than `SIMD.Vec`, whose element type must come from a
+fixed list that `BFloat16` is not on -- and bf16 is not incidental here but the
+only way to a float multiply. Like `Tile`, it is a marker type that is never
+constructed; its operators exist to be inferred. It does carry one unread field,
+because a type with a single inhabitant lets inference fold every intrinsic's
+result into that constant before the kernel compiler sees it.
 
 The FP8 formats are different, in a way worth knowing about. Their Julia
 packages implement arithmetic and conversion in software, since a CPU has no

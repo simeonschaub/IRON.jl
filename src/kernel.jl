@@ -200,6 +200,19 @@ function emit_vector!(kc::KernelContext, block::IR.Block, jblock, inst, fn, ops,
         return nothing
     end
 
+    if fn === vconvert
+        # Element type first, value second, as with the scalar conversions.
+        source = lookup!(kc, block, ops[2])
+        from = eltype(IRStructurizer.value_type(jblock, ops[2]))
+        to = eltype(inst[:type])
+        from === to && return (kc.values[ssa] = source; nothing)
+        builder = bitwidth(to) > bitwidth(from) ? arith.extf : arith.truncf
+        op = builder(source; out = result(), location = loc(ctx))
+        push!(block, op)
+        kc.values[ssa] = IR.result(op, 1)
+        return nothing
+    end
+
     if fn === vreduce_add
         source = lookup!(kc, block, ops[1])
         op = vector.reduction(
@@ -281,7 +294,8 @@ function emit_call!(kc::KernelContext, block::IR.Block, jblock, inst)
         return emit_convert!(kc, block, ssa, source, from, inst[:type])
     end
 
-    if fn in (vload, vstore!, vbroadcast, vreduce_add, vfma) || haskey(VECTOR_OPS, fn)
+    if fn in (vload, vstore!, vbroadcast, vreduce_add, vfma, vconvert) ||
+            haskey(VECTOR_OPS, fn)
         return emit_vector!(kc, block, jblock, inst, fn, ops, ssa)
     end
 

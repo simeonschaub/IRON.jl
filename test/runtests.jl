@@ -3,7 +3,6 @@ using IRON: Tile, compile_kernel!, context, memref_type, objectfifo_type, region
 using MLIR: IR
 using MLIR.Dialects: func
 using BFloat16s: BFloat16
-using SIMD: Vec
 using DLFP8Types: Float8_E4M3FN, Float8_E5M2
 using Test
 
@@ -63,6 +62,26 @@ function matmul_vec!(
         acc = zero(Vec{N, T})
         for k in 1:K
             acc = muladd(Vec{N, T}(a[i, k]), vload(Vec{N, T}, b, k, 1), acc)
+        end
+        vstore!(acc, c, i, 1)
+    end
+    return nothing
+end
+
+# bf16 operands widened per vector into an f32 accumulator. This is the only shape
+# an f32 vector.fma lowers in: convert-vector-to-aievec requires both its operands
+# to come from an arith.extf on bf16, because the MAC multiplies bf16 and there is
+# no f32 multiplier on the core.
+function matmul_bf16_vec!(
+        a::Tile{BFloat16, Tuple{M, K}}, b::Tile{BFloat16, Tuple{K, N}},
+        c::Tile{Float32, Tuple{M, N}},
+    ) where {M, K, N}
+    for i in 1:M
+        acc = zero(Vec{N, Float32})
+        for k in 1:K
+            av = Vec{N, BFloat16}(a[i, k])
+            bv = vload(Vec{N, BFloat16}, b, k, 1)
+            acc = muladd(Vec{N, Float32}(av), Vec{N, Float32}(bv), acc)
         end
         vstore!(acc, c, i, 1)
     end
@@ -339,6 +358,18 @@ end
         # pattern matches.
         @test !occursin("\"vector.fma\"", ir)
 
+        # bf16 in, f32 accumulator: both fma operands must come from an extf on
+        # bf16 or aiecc refuses to legalize the vector.fma.
+        A = Tile{BFloat16, Tuple{16, 16}}
+        C = Tile{Float32, Tuple{16, 16}}
+        bf = lower(matmul_bf16_vec!, Tuple{A, A, C})
+        @test occursin(r"vector\.load .*memref<16x16xbf16>, vector<16xbf16>", bf)
+        @test count("arith.extf", bf) == 2
+        @test occursin("arith.extf %16 : vector<16xbf16> to vector<16xf32>", bf) ||
+            occursin(r"arith\.extf .*: vector<16xbf16> to vector<16xf32>", bf)
+        @test occursin(r"vector\.fma .*: vector<16xf32>", bf)
+        @test occursin(r"vector\.store .*vector<16xf32>", bf)
+
         # vector.fma is floating-point only, so integers spell the MAC out.
         I = Tile{Int32, Tuple{16, 16}}
         int_ir = lower(matmul_vec!, Tuple{I, I, I})
@@ -362,6 +393,15 @@ end
         r = zeros(Int32, 16, 16)
         run_kernel(matmul_vec!, Tuple{I, I, I}, p, q, r)
         @test r == p * q
+
+        # The bf16 -> f32 kernel: values are small integers, exact in bf16.
+        A = Tile{BFloat16, Tuple{16, 16}}
+        C = Tile{Float32, Tuple{16, 16}}
+        u = BFloat16[(i + j) % 7 for i in 1:16, j in 1:16]
+        v = BFloat16[(i - 2j) % 5 for i in 1:16, j in 1:16]
+        w = zeros(Float32, 16, 16)
+        run_kernel(matmul_bf16_vec!, Tuple{A, A, C}, u, v, w)
+        @test w == Float32.(u) * Float32.(v)
     end
 
     @testset "generated module round-trips" begin
