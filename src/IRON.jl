@@ -35,21 +35,33 @@ println(generate_mlir(program))
 module IRON
 
 using MLIR: IR, API
-using MLIR.Dialects: arith, scf, memref
+using MLIR.Dialects: arith, scf, memref, vector
 using IRStructurizer
 using PythonCall
+using Adapt: Adapt, adapt
+using GPUArraysCore: GPUArraysCore, AbstractGPUArray, @allowscalar
 
-include("context.jl")
-include("tile.jl")
-include("dialects.jl")
-include("kernel.jl")
-include("design.jl")
+const CC = Core.Compiler
+
+include("device/intrinsics.jl")
+include("device/tile.jl")
+include("device/vec.jl")
+
+include("compiler/mlir/utils.jl")
+include("compiler/mlir/aie.jl")
+include("compiler/mlir/dataflow.jl")
+include("compiler/interpreter.jl")
+include("compiler/compiler.jl")
+
+include("array.jl")
 include("runtime.jl")
 
-export Tile
+export Tile, Vec
+export vload, vstore!, vbroadcast, vconvert
 export AIEDevice, npu1, npu2
 export ObjectFifo, Endpoint, producer, consumer
 export Worker, Runtime, start!, drain!, Program
 export generate_mlir
+export NPUArray, @allowscalar
 
 end # module

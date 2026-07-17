@@ -1,6 +1,7 @@
 [deps]
 BFloat16s = "ab4f0b2a-ad5b-11e8-123f-65d77653426b"
 DLFP8Types = "f4c16678-4a16-415b-82ef-ed337c5d6c7c"
+IRON = "d4957cf2-1973-4b5b-8ba8-222f49ed34ed"
+IRStructurizer = "93e32bba-5bb8-402b-805d-ffb066edee93"
 MLIR = "bfde9dd4-8f40-4a1e-be09-1475335e1c92"
-Microfloats = "31c70f10-a750-4521-b13c-797315ae2933"
-Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+SIMD = "fdea26ae-647d-5447-a871-4b548cad5224"

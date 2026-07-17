@@ -7,7 +7,19 @@
 function mlir_type(ctx::IR.Context, T)
     T === Int && return IR.IndexType(; context = ctx)
     T <: Tile && return memref_type(ctx, T)
-    return IR.Type(T; context = ctx)
+    T <: Vec && return vector_type(ctx, T)
+    return mlir_eltype(ctx, T)
+end
+
+"""
+    vector_type(ctx, ::Type{Vec{N,T}}) -> IR.Type
+
+The `vector<NxT>` a `SIMD.Vec` lowers to.
+"""
+function vector_type(ctx::IR.Context, ::Type{Vec{N, T}}) where {N, T}
+    return IR.Type(
+        API.mlirVectorTypeGet(1, Int64[N], mlir_eltype(ctx, T))
+    )
 end
 
 # Julia intrinsic => (MLIR builder, cmpi predicate or nothing).
@@ -31,6 +43,23 @@ const ARITH_OPS = Dict{Any, Tuple{Any, Union{Nothing, Int}}}(
     Base.eq_int => (arith.cmpi, 0),
     Base.ne_int => (arith.cmpi, 1),
     Base.:(===) => (arith.cmpi, 0),
+)
+
+# Julia conversion intrinsic => MLIR builder. These take the target type as their
+# first argument and the value as their second, so they are emitted separately from
+# ARITH_OPS, reading the result type off the instruction rather than the operands.
+#
+# Mixed precision is the point: the accelerator multiplies bf16 (or i8/i16) and
+# accumulates into a wider type, so a kernel that widens on load and narrows on
+# store is the normal shape rather than an exception.
+const CONVERT_OPS = Dict{Any, Any}(
+    Base.fpext => arith.extf,
+    Base.fptrunc => arith.truncf,
+    Base.sext_int => arith.extsi,
+    Base.zext_int => arith.extui,
+    Base.trunc_int => arith.trunci,
+    Base.sitofp => arith.sitofp,
+    Base.fptosi => arith.fptosi,
 )
 
 """
@@ -74,12 +103,21 @@ function lookup!(kc::KernelContext, block::IR.Block, v)
         error("IRON: cannot materialize $(repr(v))::$(typeof(v)) as an MLIR value")
     key = (typeof(v), v)
     haskey(kc.constants, key) && return kc.constants[key]
-    type = mlir_type(kc.ctx, typeof(v))
-    op = arith.constant(; value = IR.Attribute(v, type), location = loc(kc.ctx))
+    op = arith.constant(; value = float_or_int_attr(kc.ctx, v), location = loc(kc.ctx))
     push!(block, op)
     result = IR.result(op, 1)
     kc.constants[key] = result
     return result
+end
+
+# MLIR.jl's float attribute constructor derives the MLIR type from the Julia type
+# itself, which does not reach the element types `mlir_eltype` adds (FP8 among
+# them), so the attribute is built against an explicit type instead. MLIR rounds
+# the double to the target format.
+function float_or_int_attr(ctx::IR.Context, v)
+    type = mlir_type(ctx, typeof(v))
+    v isa AbstractFloat || return IR.Attribute(v, type)
+    return IR.Attribute(API.mlirFloatAttrDoubleGet(ctx, type, Float64(v)))
 end
 
 # Tiles are indexed from 1 like any Julia array, memrefs from 0, so every subscript
@@ -95,6 +133,131 @@ function memref_index!(kc::KernelContext, block::IR.Block, index)
     result = IR.result(op, 1)
     kc.indices[index] = result
     return result
+end
+
+# One subscript per memref dimension, each lowered from 1-based to 0-based. The
+# arity check is here because MLIR's own diagnostic for it arrives much later, from
+# the module verifier, and does not mention the kernel.
+function subscripts!(kc::KernelContext, block::IR.Block, tile::IR.Value, indices)
+    rank = Int(API.mlirShapedTypeGetRank(IR.type(tile)))
+    length(indices) == rank || error(
+        "IRON: a $(rank)-dimensional tile takes $rank subscripts, got $(length(indices))"
+    )
+    return IR.Value[memref_index!(kc, block, i) for i in indices]
+end
+
+# `arith.extf` widens and `arith.truncf` narrows; MLIR has no single float cast, and
+# each rejects the other's direction. The direction is decided from the Julia types,
+# since MLIR's C API exposes a width query for integers but not for floats.
+function emit_convert!(
+        kc::KernelContext, block::IR.Block, ssa, source::IR.Value, from::Type, to::Type
+    )
+    from === to && return (kc.values[ssa] = source; nothing)
+    builder = bitwidth(to) > bitwidth(from) ? arith.extf : arith.truncf
+    op = builder(source; out = mlir_type(kc.ctx, to), location = loc(kc.ctx))
+    push!(block, op)
+    kc.values[ssa] = IR.result(op, 1)
+    return nothing
+end
+
+# Elementwise vector arithmetic is `arith` over a vector type, not a separate
+# dialect: `arith.mulf %a, %b : vector<8xf32>` is what convert-vector-to-aievec
+# turns into an `aievec.mul_elem`.
+const VECTOR_OPS = Dict{Any, Any}(
+    vadd => (arith.addf, arith.addi),
+    vsub => (arith.subf, arith.subi),
+    vmul => (arith.mulf, arith.muli),
+    vdiv => (arith.divf, arith.divsi),
+)
+
+function emit_vector!(kc::KernelContext, block::IR.Block, jblock, inst, fn, ops, ssa)
+    ctx = kc.ctx
+    result = () -> mlir_type(ctx, inst[:type])
+
+    if fn === vload
+        # The element type is the first argument, a type rather than a value.
+        tile = lookup!(kc, block, ops[2])
+        indices = subscripts!(kc, block, tile, @view ops[3:end])
+        op = vector.load(tile, indices; result = result(), location = loc(ctx))
+        push!(block, op)
+        kc.values[ssa] = IR.result(op, 1)
+        return nothing
+    end
+
+    if fn === vstore!
+        value = lookup!(kc, block, ops[1])
+        tile = lookup!(kc, block, ops[2])
+        indices = subscripts!(kc, block, tile, @view ops[3:end])
+        push!(block, vector.store(value, tile, indices; location = loc(ctx)))
+        return nothing
+    end
+
+    if fn === vbroadcast
+        source = lookup!(kc, block, ops[2])
+        op = vector.broadcast(source; vector = result(), location = loc(ctx))
+        push!(block, op)
+        kc.values[ssa] = IR.result(op, 1)
+        return nothing
+    end
+
+    if fn === vconvert
+        # Element type first, value second, as with the scalar conversions.
+        source = lookup!(kc, block, ops[2])
+        from = eltype(IRStructurizer.value_type(jblock, ops[2]))
+        to = eltype(inst[:type])
+        from === to && return (kc.values[ssa] = source; nothing)
+        if to <: Signed && from <: Signed
+            builder = bitwidth(to) > bitwidth(from) ? arith.extsi : arith.truncsi
+        elseif to <: Unsigned && from <: Unsigned
+            builder = bitwidth(to) > bitwidth(from) ? arith.extui : arith.truncui
+        elseif to <: AbstractFloat && from <: AbstractFloat
+            builder = bitwidth(to) > bitwidth(from) ? arith.extf : arith.truncf
+        else
+            error("Unsupported vector conversion from $from to $to")
+        end
+        op = builder(source; out = result(), location = loc(ctx))
+        push!(block, op)
+        kc.values[ssa] = IR.result(op, 1)
+        return nothing
+    end
+
+    if fn === vreduce_add
+        source = lookup!(kc, block, ops[1])
+        op = vector.reduction(
+            source; dest = result(), kind = IR.Attribute("add"; context = ctx),
+            location = loc(ctx),
+        )
+        push!(block, op)
+        kc.values[ssa] = IR.result(op, 1)
+        return nothing
+    end
+
+    if fn === vfma
+        a, b, c = (lookup!(kc, block, o) for o in ops)
+        if eltype(inst[:type]) <: AbstractFloat
+            op = vector.fma(a, b, c; result = result(), location = loc(ctx))
+            push!(block, op)
+        else
+            # vector.fma is floating-point only, so an integer multiply-accumulate
+            # is spelled out. The two ops fuse again downstream.
+            mul = arith.muli(a, b; result = result(), location = loc(ctx))
+            push!(block, mul)
+            op = arith.addi(
+                IR.result(mul, 1), c; result = result(), location = loc(ctx)
+            )
+            push!(block, op)
+        end
+        kc.values[ssa] = IR.result(op, 1)
+        return nothing
+    end
+
+    float_op, int_op = VECTOR_OPS[fn]
+    builder = eltype(inst[:type]) <: AbstractFloat ? float_op : int_op
+    args = IR.Value[lookup!(kc, block, o) for o in ops]
+    op = builder(args...; result = result(), location = loc(ctx))
+    push!(block, op)
+    kc.values[ssa] = IR.result(op, 1)
+    return nothing
 end
 
 function emit_call!(kc::KernelContext, block::IR.Block, jblock, inst)
@@ -113,9 +276,9 @@ function emit_call!(kc::KernelContext, block::IR.Block, jblock, inst)
 
     if fn === Base.getindex
         tile = lookup!(kc, block, ops[1])
-        index = memref_index!(kc, block, ops[2])
+        indices = subscripts!(kc, block, tile, @view ops[2:end])
         op = memref.load(
-            tile, IR.Value[index];
+            tile, indices;
             result = mlir_type(kc.ctx, inst[:type]), location = loc(kc.ctx),
         )
         push!(block, op)
@@ -126,8 +289,34 @@ function emit_call!(kc::KernelContext, block::IR.Block, jblock, inst)
     if fn === Base.setindex!
         tile = lookup!(kc, block, ops[1])
         value = lookup!(kc, block, ops[2])
-        index = memref_index!(kc, block, ops[3])
-        push!(block, memref.store(value, tile, IR.Value[index]; location = loc(kc.ctx)))
+        indices = subscripts!(kc, block, tile, @view ops[3:end])
+        push!(block, memref.store(value, tile, indices; location = loc(kc.ctx)))
+        return nothing
+    end
+
+    if fn === convert_float
+        # The target is the second argument, a type rather than a value, so it is
+        # read off the inferred result type instead of the operand list.
+        source = lookup!(kc, block, ops[1])
+        from = IRStructurizer.value_type(jblock, ops[1])
+        return emit_convert!(kc, block, ssa, source, from, inst[:type])
+    end
+
+    if fn in (vload, vstore!, vbroadcast, vreduce_add, vfma, vconvert) ||
+            haskey(VECTOR_OPS, fn)
+        return emit_vector!(kc, block, jblock, inst, fn, ops, ssa)
+    end
+
+    builder = get(CONVERT_OPS, fn, nothing)
+    if builder !== nothing
+        # Julia's conversion intrinsics are `f(T, x)`: the type comes first, so the
+        # value is the second operand and the target is the inferred result type.
+        source = lookup!(kc, block, ops[2])
+        op = builder(
+            source; out = mlir_type(kc.ctx, inst[:type]), location = loc(kc.ctx)
+        )
+        push!(block, op)
+        kc.values[ssa] = IR.result(op, 1)
         return nothing
     end
 
@@ -257,12 +446,16 @@ the point of use rather than emitted as a separate function.
 
 Only kernels returning `nothing` are supported: a kernel communicates through the
 tiles it writes.
+
+Inference runs under [`IRONInterpreter`](@ref), so the kernel is inferred against
+device semantics -- notably, FP8 conversions stay single operations instead of
+expanding into the software implementations their packages provide.
 """
 function compile_kernel!(
         ctx::IR.Context, block::IR.Block, @nospecialize(f), @nospecialize(argtypes),
         args::Vector{IR.Value},
     )
-    results = IRStructurizer.code_structured(f, argtypes)
+    results = IRStructurizer.code_structured(f, argtypes; interp = IRONInterpreter())
     length(results) == 1 ||
         error("IRON: expected exactly one method of $f for $argtypes, found $(length(results))")
     sci, rettype = only(results)

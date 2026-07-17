@@ -29,10 +29,10 @@ program = Program(npu2, rt, [Buf, Buf])
 if get(ENV, "IRON_RUN", "0") == "1"
     # Needs an NPU, XRT and the MLIR-AIE toolchain.
     compiled = IRON.compile(program)
-    a = IRON.device_array(Int32.(0:1023))
-    b = IRON.device_zeros(Buf)
+    a = NPUArray(Int32.(0:1023))
+    b = NPUArray{Int32}(undef, Buf)
     IRON.run!(compiled, a, b)
-    result = IRON.host_array(b)
+    result = Array(b)
     @assert result == Int32.(1:1024)
     println("NPU result: ", result[1:8], " ... ", result[(end - 3):end])
 else
