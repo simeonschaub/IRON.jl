@@ -114,6 +114,32 @@ A kernel is generic in its element type: `examples/matmul.jl` writes one
 The first four need nothing special: Julia lowers their arithmetic to intrinsics
 already, `BFloat16` included, because LLVM has all four natively.
 
+### What the hardware will actually run
+
+Generating correct MLIR for a type is not the same as the core executing it, and
+the gap is wide enough to be worth stating. `_MM_COMBOS` in
+`aie/iron/kernels/linalg.py` lists every type combination the accelerator
+multiplies -- `(i8,i8) (i8,i16) (i8,i32) (i16,i16) (i16,i32) (bf16,bf16)
+(bf16,f32)` -- and f32 appears only as an accumulator, never as an operand.
+
+Measured on an NPU2, with `examples/diagnose.jl`:
+
+| kernel | result |
+|---|---|
+| copy, i32 and f32, 1-D and 2-D | passes |
+| matmul, i32 | passes |
+| matmul, f32 | **wrong data** |
+| matmul, bf16 operands, f32 accumulator | **wrong data** |
+
+Moving floats is fine; multiplying them scalar-wise on the core is not, and it
+fails silently rather than refusing to compile. The bf16 case fails for the same
+reason -- widening on load is one `arith.extf`, but the accumulate is still scalar
+f32. So today a pure-Julia kernel that computes should use integers;
+`examples/matmul.jl` runs the i32 design for that reason. Real float throughput
+lives in the vector unit (`aie::mmul`), which this package does not reach yet --
+that needs the `aievec` dialect and the pre-tiled `dims_to_stream` layouts the
+reference kernels use.
+
 The FP8 formats are different, in a way worth knowing about. Their Julia
 packages implement arithmetic and conversion in software, since a CPU has no
 FP8, so inferring a kernel against those methods buries one hardware conversion

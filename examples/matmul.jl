@@ -2,8 +2,18 @@
 #
 # The kernel is generic Julia: `matmul!` is not specialised per element type, and
 # the same source lowers to i32, f16, bf16 or f32 arithmetic depending on the tile
-# types it is instantiated with. `matmul_fp8!` shows the split the hardware
-# actually wants for the narrow formats -- FP8 in memory, f32 in the accumulator.
+# types it is instantiated with.
+#
+# Which of those the hardware will actually execute is a separate question, and a
+# sharp one. `_MM_COMBOS` in aie/iron/kernels/linalg.py lists every type
+# combination the accelerator multiplies:
+#
+#     (i8,i8) (i8,i16) (i8,i32) (i16,i16) (i16,i32) (bf16,bf16) (bf16,f32)
+#
+# f32 appears only as an accumulator, never as an operand -- there is no f32
+# multiplier. An f32 x f32 kernel compiles, runs, and returns wrong data; the
+# integer one returns the right answer. So this example runs the integer design,
+# which is verified on hardware, and prints the MLIR for the rest.
 #
 # Run with the MLIR-AIE ironenv python so the compile/run half can find `aie`:
 #   JULIA_PYTHONCALL_EXE=/path/to/mlir-aie/ironenv/bin/python julia --project examples/matmul.jl
@@ -34,22 +44,23 @@ function matmul!(
 end
 
 """
-    matmul_fp8!(a, b, c)
+    matmul_mixed!(a, b, c)
 
-`c = a * b` with FP8 operands and an f32 accumulator.
+`c = a * b` with narrow operands and a wide accumulator.
 
-FP8 is a storage format: there is no FP8 arithmetic to emit, so each element is
-widened on load. Those conversions are single `arith.extf` ops rather than the
-software conversion the FP8 package defines -- see `src/interpreter.jl`.
+This is the shape the accelerator is built around: it multiplies bf16 (or i8/i16)
+and accumulates into something wider, so a kernel widens each element on load and
+adds in the accumulator's type. `Float32(a[i, k])` is one `arith.extf`.
+
+The same source serves any narrow input type, FP8 included -- see `fp8.jl`.
 """
-function matmul_fp8!(
-        a::Tile{Float8_E4M3FN, Tuple{M, K}}, b::Tile{Float8_E4M3FN, Tuple{K, N}},
-        c::Tile{Float32, Tuple{M, N}},
-    ) where {M, K, N}
+function matmul_mixed!(
+        a::Tile{Tin, Tuple{M, K}}, b::Tile{Tin, Tuple{K, N}}, c::Tile{Tacc, Tuple{M, N}}
+    ) where {Tin, Tacc, M, K, N}
     for i in 1:M, j in 1:N
-        acc = zero(Float32)
+        acc = zero(Tacc)
         for k in 1:K
-            acc += Float32(a[i, k]) * Float32(b[k, j])
+            acc += Tacc(a[i, k]) * Tacc(b[k, j])
         end
         c[i, j] = acc
     end
@@ -77,25 +88,24 @@ end
 
 square(::Type{T}) where {T} = Tile{T, Tuple{M, K}}
 
+# Buffer allocation defaults to bank-aware, falling back to basic-sequential only
+# when bank-aware reports failure. With three object FIFOs on one core it does not
+# report failure -- it produces an allocation whose buffers overlap, and C comes
+# back holding A's bytes. Every matrix multiply under programming_examples/ passes
+# this same flag.
+const AIECC_FLAGS = ["--alloc-scheme=basic-sequential"]
+
 if get(ENV, "IRON_RUN", "0") == "1"
     # Needs an NPU, XRT and the MLIR-AIE toolchain.
-    T = Float32
+    T = Int32
     program = matmul_program(matmul!, square(T), square(T), square(T))
+    compiled = IRON.compile(program; aiecc_flags = AIECC_FLAGS)
 
-    # Buffer allocation defaults to bank-aware, falling back to basic-sequential
-    # only when bank-aware reports failure. With three object FIFOs on one core it
-    # does not report failure -- it produces an allocation whose buffers overlap,
-    # and C comes back holding A's bytes. Every matrix multiply under
-    # programming_examples/ passes this same flag.
-    compiled = IRON.compile(program; aiecc_flags = ["--alloc-scheme=basic-sequential"])
-
-    # Both operands are asymmetric and neither is the identity, so a transposed
-    # tile or a swapped pair of operands changes the answer. Every value here is a
-    # small integer and every partial sum stays well under 2^24, so the product is
-    # exact in f32 and can be compared for equality. A symmetric `a` with `b = I`
-    # is a trap: it is invariant under exactly the mistakes worth catching.
-    a = T[T(10i + j) for i in 1:M, j in 1:K]
-    b = T[T(i - 2j) for i in 1:K, j in 1:N]
+    # Asymmetric, and neither one the identity, so a transposed tile or a swapped
+    # pair of operands changes the answer. A symmetric `a` with `b = I` is a trap:
+    # it is invariant under exactly the mistakes worth catching.
+    a = T[10i + j for i in 1:M, j in 1:K]
+    b = T[i - 2j for i in 1:K, j in 1:N]
     da, db = IRON.device_array(a), IRON.device_array(b)
     dc = IRON.device_zeros(square(T))
     IRON.run!(compiled, da, db, dc)
@@ -105,8 +115,7 @@ if get(ENV, "IRON_RUN", "0") == "1"
     if result == expected
         println("NPU matmul matches")
     else
-        wrong = count(!=(0), result .!= expected)
-        println("MISMATCH in $wrong of $(length(expected)) elements")
+        println("MISMATCH in $(count(result .!= expected)) of $(length(expected))")
         println("got:\n", result)
         println("expected:\n", expected)
     end
@@ -121,19 +130,25 @@ else
         ]
     end
 
-    for T in (Int32, Float16, BFloat16, Float32)
+    println("one kernel, one line of Julia per element type:\n")
+    for T in (Int16, Int32, Float16, BFloat16, Float32)
         mlir = generate_mlir(matmul_program(matmul!, square(T), square(T), square(T)))
-        println(rpad(string(T), 10), " -> ", join(mac(mlir), " ; "))
+        println("  ", rpad(string(T), 10), join(mac(mlir), " ; "))
     end
 
-    # FP8 operands, f32 accumulator.
-    fp8 = generate_mlir(
-        matmul_program(
-            matmul_fp8!, square(Float8_E4M3FN), square(Float8_E4M3FN), square(Float32)
+    function widening(mlir)
+        for l in split(mlir, '\n')
+            m = match(r"arith\.extf [^:]*: (.+)$", l)
+            m === nothing || return "arith.extf " * m.captures[1]
+        end
+        return "(none)"
+    end
+
+    println("\nnarrow operands, wide accumulator -- the shape the hardware is built for:\n")
+    for (Tin, Tacc) in ((BFloat16, Float32), (Float8_E4M3FN, Float32))
+        mlir = generate_mlir(
+            matmul_program(matmul_mixed!, square(Tin), square(Tin), square(Tacc))
         )
-    )
-    println("\nFP8 kernel:")
-    for line in split(fp8, '\n')
-        occursin(r"arith\.(extf|mulf|addf)|memref\.load", line) && println("  ", strip(line))
+        println("  ", rpad("$Tin -> $Tacc", 26), widening(mlir), " ; ", join(mac(mlir), " ; "))
     end
 end
