@@ -137,10 +137,10 @@ function run_case(::Type{Tin}, ::Type{Tacc}) where {Tin, Tacc}
     compiled = IRON.compile(
         matmul_program(matmul_vec!, Tin, Tacc); aiecc_flags = AIECC_FLAGS
     )
-    dc = IRON.device_zeros(Tile{Tacc, Tuple{tile_size(Tacc), tile_size(Tacc)}})
-    IRON.run!(compiled, IRON.device_array(a), IRON.device_array(b), dc)
+    dc = NPUArray{Tacc}(undef, Tile{Tacc, Tuple{tile_size(Tacc), tile_size(Tacc)}})
+    IRON.run!(compiled, NPUArray(a), NPUArray(b), dc)
 
-    result = IRON.host_array(dc)
+    result = Array(dc)
     expected = Tacc.(Float32.(a) * Float32.(b))
     if result == expected
         println(label, "PASS")

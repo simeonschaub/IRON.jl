@@ -38,6 +38,8 @@ using MLIR: IR, API
 using MLIR.Dialects: arith, scf, memref, vector
 using IRStructurizer
 using PythonCall
+using Adapt: Adapt, adapt
+using GPUArraysCore: GPUArraysCore, AbstractGPUArray, @allowscalar
 
 const CC = Core.Compiler
 
@@ -51,6 +53,7 @@ include("compiler/mlir/dataflow.jl")
 include("compiler/interpreter.jl")
 include("compiler/compiler.jl")
 
+include("array.jl")
 include("runtime.jl")
 
 export Tile, Vec
@@ -59,5 +62,6 @@ export AIEDevice, npu1, npu2
 export ObjectFifo, Endpoint, producer, consumer
 export Worker, Runtime, start!, drain!, Program
 export generate_mlir
+export NPUArray, @allowscalar
 
 end # module

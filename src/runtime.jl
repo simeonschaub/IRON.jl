@@ -115,48 +115,18 @@ function compile(p::Program; path::Union{Nothing, AbstractString} = nothing, kwa
 end
 
 """
-    device_array(A) -> Py
+    run!(compiled, arrays...) -> nothing
 
-Copy Julia array `A` into an NPU-resident XRT buffer.
-"""
-function device_array(A::AbstractArray{T}) where {T}
-    # `dtype` has to be passed even though the array already carries it: the tensor
-    # constructor defaults to uint32 and sizes the XRT buffer from the kwarg rather
-    # than from the data, then fails copying into the mistyped buffer.
-    dtype = numpy_dtype(T)
-    host = np().array(host_values(A); dtype)
-    return iron().tensor(host; dtype, device = "npu")
-end
-
-"""
-    device_zeros(::Type{Tile{T,Dims}}) -> Py
-
-An NPU-resident XRT buffer shaped like the given tile, zero filled.
-"""
-function device_zeros(::Type{Tile{T, Dims}}) where {T, Dims}
-    return iron().zeros(size(Tile{T, Dims})...; dtype = numpy_dtype(T), device = "npu")
-end
-
-"""
-    run!(compiled, buffers...) -> nothing
-
-Run the design on the NPU. `buffers` are NPU-resident arrays -- one per runtime
-sequence argument, in order -- as returned by [`device_array`](@ref) or
-[`device_zeros`](@ref). Outputs are written in place.
+Run the design on the NPU. `arrays` are the NPU-resident [`NPUArray`](@ref)s -- one
+per runtime sequence argument, in order. Outputs are written in place; copy them
+back to the host with `Array`.
 
 The first call compiles the design; later calls reuse the cached xclbin.
 """
-function run!(c::CompiledProgram, buffers::Py...)
-    length(buffers) == length(c.program.argtypes) || error(
-        "IRON: design takes $(length(c.program.argtypes)) buffers, got $(length(buffers))"
+function run!(c::CompiledProgram, arrays::NPUArray...)
+    length(arrays) == length(c.program.argtypes) || error(
+        "IRON: design takes $(length(c.program.argtypes)) buffers, got $(length(arrays))"
     )
-    c.design(buffers...)
+    c.design(map(buffer, arrays)...)
     return nothing
 end
-
-"""
-    host_array(buffer) -> Array
-
-Copy an NPU-resident buffer back to a Julia array.
-"""
-host_array(buffer::Py) = pyconvert(Array, buffer.numpy())

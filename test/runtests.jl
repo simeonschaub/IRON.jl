@@ -155,6 +155,33 @@ end
         @test eltype(Buf) === Int32
     end
 
+    @testset "NPUArray host array" begin
+        # Built directly from a placeholder buffer: this exercises the Julia-side
+        # array interface and the Adapt mapping without an NPU or the Python stack.
+        a = IRON.NPUArray{Int32, 2}(IRON.Py(nothing), (2, 3))
+        @test a isa IRON.AbstractGPUArray{Int32, 2}
+        @test eltype(a) === Int32
+        @test size(a) == (2, 3)
+        @test ndims(a) == 2
+        @test length(a) == 6
+
+        # A host buffer adapts to the kernel-side Tile view it will be compiled
+        # against -- the IRON analogue of CuArray -> CuDeviceArray.
+        @test IRON.kernelconvert(a) === Tile{Int32, Tuple{2, 3}}
+
+        # Scalar access is guarded off by default (assertscalar fires before the
+        # buffer is touched); under @allowscalar it forwards to the buffer, which
+        # here is only a placeholder, so it fails past the guard rather than at it.
+        @test_throws Exception a[1, 1]
+        @test hasmethod(getindex, Tuple{typeof(a), Int, Int})
+        @test hasmethod(setindex!, Tuple{typeof(a), Int32, Int, Int})
+
+        # Contents are never printed (that would copy the buffer back element by
+        # element); the summary names the type and shape instead.
+        @test occursin("NPUArray", sprint(show, a))
+        @test occursin("2×3", sprint(show, MIME("text/plain"), a))
+    end
+
     @testset "kernel lowering" begin
         ir = lower(add_one, Tuple{Buf, Buf})
         # The loop and the arithmetic survive as ops rather than being folded away:

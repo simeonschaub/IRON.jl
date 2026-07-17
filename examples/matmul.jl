@@ -106,11 +106,11 @@ if get(ENV, "IRON_RUN", "0") == "1"
     # it is invariant under exactly the mistakes worth catching.
     a = T[10i + j for i in 1:M, j in 1:K]
     b = T[i - 2j for i in 1:K, j in 1:N]
-    da, db = IRON.device_array(a), IRON.device_array(b)
-    dc = IRON.device_zeros(square(T))
+    da, db = NPUArray(a), NPUArray(b)
+    dc = NPUArray{T}(undef, square(T))
     IRON.run!(compiled, da, db, dc)
 
-    result = IRON.host_array(dc)
+    result = Array(dc)
     expected = a * b
     if result == expected
         println("NPU matmul matches")

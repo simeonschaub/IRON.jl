@@ -56,11 +56,11 @@ interpreter before loading IRON:
 ENV["JULIA_PYTHONCALL_EXE"] = "/path/to/mlir-aie/ironenv/bin/python"
 using IRON
 
-compiled = IRON.compile(program)          # writes .mlir, hands it to aiecc
-a = IRON.device_array(Int32.(0:1023))     # XRT buffers on the NPU
-b = IRON.device_zeros(Buf)
+compiled = IRON.compile(program)     # writes .mlir, hands it to aiecc
+a = NPUArray(Int32.(0:1023))         # NPU-resident XRT buffers
+b = NPUArray{Int32}(undef, Buf)
 IRON.run!(compiled, a, b)
-IRON.host_array(b) == Int32.(1:1024)
+Array(b) == Int32.(1:1024)           # copy the result back to the host
 ```
 
 Keyword arguments to `compile` are forwarded to `aie.iron.jit`. One of them is
