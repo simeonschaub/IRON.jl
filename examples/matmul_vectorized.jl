@@ -36,7 +36,14 @@ using IRON
 using BFloat16s: BFloat16
 using DLFP8Types: Float8_E4M3FN, Float8_E5M2
 
-const M, K, N = 16, 16, 16   # one vector wide
+"""
+    tile_size(Tacc) -> Int
+
+How wide a tile is, which is how wide a vector is: one 512-bit AIE2 register holds
+16 f32 or i32, 32 bf16 or i16, 64 i8. The accumulator sets it, since that is what
+the kernel carries across the k loop.
+"""
+tile_size(::Type{Tacc}) where {Tacc} = 512 ÷ (8 * sizeof(Tacc))
 
 """
     mac_via(T, Tacc) -> Type
@@ -98,8 +105,9 @@ function matmul_vec!(
 end
 
 function matmul_program(kernel, ::Type{Tin}, ::Type{Tacc}) where {Tin, Tacc}
-    A = Tile{Tin, Tuple{M, K}}
-    C = Tile{Tacc, Tuple{M, N}}
+    S = tile_size(Tacc)
+    A = Tile{Tin, Tuple{S, S}}
+    C = Tile{Tacc, Tuple{S, S}}
     of_a, of_b, of_c = ObjectFifo{A}("a"), ObjectFifo{A}("b"), ObjectFifo{C}("c")
 
     rt = Runtime()
@@ -118,17 +126,18 @@ const AIECC_FLAGS = ["--alloc-scheme=basic-sequential"]
 
 # Every value here is a small integer, exact in bf16 and in FP8's 4-bit mantissa,
 # so each product can be compared for equality rather than tolerance.
-operand(::Type{T}, f) where {T} = T[T(f(i, j)) for i in 1:M, j in 1:K]
+operand(::Type{T}, ::Type{Tacc}, f) where {T, Tacc} =
+    T[T(f(i, j)) for i in 1:tile_size(Tacc), j in 1:tile_size(Tacc)]
 
 function run_case(::Type{Tin}, ::Type{Tacc}) where {Tin, Tacc}
     label = rpad("$Tin -> $Tacc", 26)
-    a = operand(Tin, (i, j) -> (i + j) % 7)
-    b = operand(Tin, (i, j) -> (i - 2j) % 5)
+    a = operand(Tin, Tacc, (i, j) -> (i + j) % 7)
+    b = operand(Tin, Tacc, (i, j) -> (i - 2j) % 5)
 
     compiled = IRON.compile(
         matmul_program(matmul_vec!, Tin, Tacc); aiecc_flags = AIECC_FLAGS
     )
-    dc = IRON.device_zeros(Tile{Tacc, Tuple{M, N}})
+    dc = IRON.device_zeros(Tile{Tacc, Tuple{tile_size(Tacc), tile_size(Tacc)}})
     IRON.run!(compiled, IRON.device_array(a), IRON.device_array(b), dc)
 
     result = IRON.host_array(dc)
@@ -150,22 +159,32 @@ if get(ENV, "IRON_RUN", "0") == "1"
     # backtrace is the useful part.
     #
     #   BFloat16 -> Float32       PASS
+    #   Int16 -> Int16            same type, so nothing widens and the multiply stays
+    #                             in i16 -- the type the vector unit multiplies. This
+    #                             is the integer workaround; it wraps rather than
+    #                             widening, so the products have to fit in i16.
     #   Int16 -> Int32            peano: "unable to legalize <16 x s32> G_MUL".
-    #                             The MAC widens i16 to i32 internally; there is no
-    #                             i32 vector multiply for the aievec op to sit on,
-    #                             and arith.muli reaches peano unclaimed.
-    #   Float8_E4M3FN -> Float32  aiecc fails somewhere past the aievec conversion.
+    #                             Nothing converts an integer multiply on AIE2p
+    #                             (configureAIEVecV2PLegalizations has no MulIOp
+    #                             rule), so it reaches peano as a plain LLVM mul and
+    #                             there is no i32 vector multiply to select.
+    #   Float8_E4M3FN -> Float32  the f8 -> bf16 widening becomes an aievec.ups whose
+    #                             result type is not widened at all, because
+    #                             getVectorOpDestType only widens 16-bit floats.
     #
     run_case(BFloat16, Float32)
-    run_case(Int16, Int32)
     run_case(Float8_E4M3FN, Float32)
+    run_case(Int16, Int16)
+    run_case(Int16, Int32)
 else
     show_ops(mlir) = for l in split(mlir, '\n')
         occursin(r"vector\.(load|store|broadcast|fma)|arith\.(extf|extsi|muli|addi) .*vector", l) &&
             println("    ", strip(replace(l, r"^\s*%\w+ = " => "")))
     end
 
-    for (Tin, Tacc) in ((Int16, Int32), (BFloat16, Float32), (Float8_E4M3FN, Float32))
+    for (Tin, Tacc) in (
+            (Int16, Int16), (Int16, Int32), (BFloat16, Float32), (Float8_E4M3FN, Float32),
+        )
         println("  $Tin -> $Tacc:")
         show_ops(generate_mlir(matmul_program(matmul_vec!, Tin, Tacc)))
         println()
