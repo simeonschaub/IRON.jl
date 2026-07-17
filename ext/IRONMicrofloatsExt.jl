@@ -15,6 +15,11 @@ const FP8_TYPES = (Float8_E4M3FN, Float8_E5M2)
 IRON.mlir_eltype(ctx::IR.Context, ::Type{Float8_E4M3FN}) = IR.Float8E4M3FN(; context = ctx)
 IRON.mlir_eltype(ctx::IR.Context, ::Type{Float8_E5M2}) = IR.Float8E5M2(; context = ctx)
 
+# numpy has no FP8; ml_dtypes supplies the same two formats under these names.
+IRON.numpy_dtype(::Type{Float8_E4M3FN}) = IRON.ml_dtypes().float8_e4m3fn
+IRON.numpy_dtype(::Type{Float8_E5M2}) = IRON.ml_dtypes().float8_e5m2
+IRON.host_values(A::AbstractArray{<:Union{FP8_TYPES...}}) = Float32.(A)
+
 # Microfloats are stored one per byte, so the default `8 * sizeof` over-counts the
 # sub-byte formats. The width is what decides widening against narrowing.
 IRON.bitwidth(::Type{T}) where {T <: Microfloats.Microfloat} = Microfloats.bitwidth(T)

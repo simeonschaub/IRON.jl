@@ -39,17 +39,52 @@ end
 iron() = pymodule("aie.iron")
 np() = pymodule("numpy")
 
-# Element types the NPU and numpy agree on.
+"""
+    ml_dtypes() -> Py
+
+The `ml_dtypes` module, which supplies the element types numpy lacks natively --
+bfloat16 and the FP8 formats. MLIR-AIE depends on it, so it is present wherever
+`aie` is.
+"""
+ml_dtypes() = pymodule("ml_dtypes")
+
+# Element types numpy has natively.
 const NUMPY_DTYPES = Dict{Type, String}(
     Int8 => "int8", Int16 => "int16", Int32 => "int32", Int64 => "int64",
     UInt8 => "uint8", UInt16 => "uint16", UInt32 => "uint32", UInt64 => "uint64",
     Float16 => "float16", Float32 => "float32", Float64 => "float64",
 )
 
+"""
+    numpy_dtype(T) -> Py
+
+The numpy dtype for Julia element type `T`.
+
+Overload this for an element type numpy does not have; `ml_dtypes` provides the
+ones the NPU cares about, and the FP8 formats are attached that way in `ext/`.
+"""
 function numpy_dtype(::Type{T}) where {T}
-    haskey(NUMPY_DTYPES, T) || error("IRON: no numpy dtype for $T")
-    return getproperty(np(), Symbol(NUMPY_DTYPES[T]))
+    name = get(NUMPY_DTYPES, T, nothing)
+    name === nothing && error(
+        "IRON: no numpy dtype for $T; overload IRON.numpy_dtype to add one"
+    )
+    return getproperty(np(), Symbol(name))
 end
+
+numpy_dtype(::Type{Core.BFloat16}) = ml_dtypes().bfloat16
+
+"""
+    host_values(A) -> AbstractArray
+
+`A` in a form PythonCall can hand to numpy.
+
+An array whose element type numpy shares is passed through. The rest go via
+`Float32`, which each of them converts to exactly, and numpy narrows back to the
+target dtype on the way into the buffer -- PythonCall has no numpy counterpart for
+a `BFloat16` or FP8 array to convert directly.
+"""
+host_values(A::AbstractArray) = collect(A)
+host_values(A::AbstractArray{<:Union{Core.BFloat16}}) = Float32.(A)
 
 """
     CompiledProgram
@@ -89,7 +124,7 @@ function device_array(A::AbstractArray{T}) where {T}
     # constructor defaults to uint32 and sizes the XRT buffer from the kwarg rather
     # than from the data, then fails copying into the mistyped buffer.
     dtype = numpy_dtype(T)
-    host = np().array(collect(A); dtype)
+    host = np().array(host_values(A); dtype)
     return iron().tensor(host; dtype, device = "npu")
 end
 

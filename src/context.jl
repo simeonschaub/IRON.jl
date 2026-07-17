@@ -16,12 +16,36 @@ allowed, so that `aie`/`aiex` operations can be built generically.
 function context()
     registry = IR.DialectRegistry()
     API.mlirRegisterAllDialects(registry)
+    API.mlirRegisterAllPasses()
     ctx = IR.Context(registry)
     IR.allow_unregistered_dialects!(true; context = ctx)
     for dialect in ("func", "scf", "arith", "memref")
         IR.get_or_load_dialect!(dialect; context = ctx)
     end
     return ctx
+end
+
+"""
+    canonicalize!(mod, ctx) -> mod
+
+Run `canonicalize` and `cse` over `mod`.
+
+Structurizing Julia's IR leaves a loop carrying values it never changes -- the
+enclosing loops' induction variables, threaded through as if they were
+accumulators. Canonicalization drops them, which brings the core body down to the
+one carried value the kernel actually has and folds the constant loop bounds. The
+`aie` ops pass through untouched: they are unregistered here, so they carry no
+patterns, and an unregistered op is assumed to have side effects and is not
+removed.
+"""
+function canonicalize!(mod::IR.Module, ctx::IR.Context)
+    pm = IR.PassManager(; context = ctx)
+    # The pipeline is added to the top-level manager unnested. Wrapping it in
+    # `builtin.module(...)` would build a manager anchored at *contained* modules,
+    # of which there are none, and every pass would silently not run.
+    IR.add_pipeline!(IR.OpPassManager(pm), "canonicalize,cse")
+    IR.run!(pm, mod)
+    return mod
 end
 
 """

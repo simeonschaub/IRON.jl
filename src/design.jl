@@ -256,16 +256,20 @@ function check_supported(p::Program)
 end
 
 """
-    generate_mlir(program; ctx=IRON.context()) -> String
+    generate_mlir(program; canonicalize=true, ctx=IRON.context()) -> String
 
 Compile `program` -- including its Julia kernels -- to MLIR and return the module
 as text, ready for `aie-opt`/`aiecc`.
+
+`canonicalize` tidies the emitted kernel, which mostly means dropping the loop
+carries that structurizing Julia's IR leaves behind; see [`canonicalize!`](@ref).
+Pass `false` to see exactly what the kernel compiler emitted.
 
 The upstream ops print with their custom assembly, while the `aie` ops print in
 generic form because this context does not have the dialect registered. `aie-opt`,
 which does, accepts either.
 """
-function generate_mlir(p::Program; ctx::IR.Context = context())
+function generate_mlir(p::Program; canonicalize::Bool = true, ctx::IR.Context = context())
     check_supported(p)
     device_body = IR.Block(IR.Type[], IR.Location[])
 
@@ -316,10 +320,10 @@ function generate_mlir(p::Program; ctx::IR.Context = context())
     # Verification only covers the upstream ops -- the aie ops are unregistered here
     # and carry no verifier -- but that is enough to catch a malformed kernel before
     # it reaches aiecc, where the same mistake surfaces far less legibly.
-    op = IR.Operation(mod)
-    IR.verify(op) || error(
+    IR.verify(IR.Operation(mod)) || error(
         "IRON: generated an invalid MLIR module (see the diagnostics above)"
     )
+    canonicalize && canonicalize!(mod, ctx)
 
-    return string(op)
+    return string(IR.Operation(mod))
 end

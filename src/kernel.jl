@@ -33,6 +33,23 @@ const ARITH_OPS = Dict{Any, Tuple{Any, Union{Nothing, Int}}}(
     Base.:(===) => (arith.cmpi, 0),
 )
 
+# Julia conversion intrinsic => MLIR builder. These take the target type as their
+# first argument and the value as their second, so they are emitted separately from
+# ARITH_OPS, reading the result type off the instruction rather than the operands.
+#
+# Mixed precision is the point: the accelerator multiplies bf16 (or i8/i16) and
+# accumulates into a wider type, so a kernel that widens on load and narrows on
+# store is the normal shape rather than an exception.
+const CONVERT_OPS = Dict{Any, Any}(
+    Base.fpext => arith.extf,
+    Base.fptrunc => arith.truncf,
+    Base.sext_int => arith.extsi,
+    Base.zext_int => arith.extui,
+    Base.trunc_int => arith.trunci,
+    Base.sitofp => arith.sitofp,
+    Base.fptosi => arith.fptosi,
+)
+
 """
     KernelContext
 
@@ -171,6 +188,19 @@ function emit_call!(kc::KernelContext, block::IR.Block, jblock, inst)
         source = lookup!(kc, block, ops[1])
         from = IRStructurizer.value_type(jblock, ops[1])
         return emit_convert!(kc, block, ssa, source, from, inst[:type])
+    end
+
+    builder = get(CONVERT_OPS, fn, nothing)
+    if builder !== nothing
+        # Julia's conversion intrinsics are `f(T, x)`: the type comes first, so the
+        # value is the second operand and the target is the inferred result type.
+        source = lookup!(kc, block, ops[2])
+        op = builder(
+            source; out = mlir_type(kc.ctx, inst[:type]), location = loc(kc.ctx)
+        )
+        push!(block, op)
+        kc.values[ssa] = IR.result(op, 1)
+        return nothing
     end
 
     entry = get(ARITH_OPS, fn, nothing)

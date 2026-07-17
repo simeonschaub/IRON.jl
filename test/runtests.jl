@@ -22,6 +22,23 @@ function matmul!(
     return nothing
 end
 
+# bf16 operands widened to an f32 accumulator. `_MM_COMBOS` in
+# aie/iron/kernels/linalg.py lists every type combination the accelerator can
+# multiply, and (bfloat16, float32) is one of them, while f32 x f32 is not.
+function matmul_mixed!(
+        a::Tile{BFloat16, Tuple{M, K}}, b::Tile{BFloat16, Tuple{K, N}},
+        c::Tile{Float32, Tuple{M, N}},
+    ) where {M, K, N}
+    for i in 1:M, j in 1:N
+        acc = zero(Float32)
+        for k in 1:K
+            acc += Float32(a[i, k]) * Float32(b[k, j])
+        end
+        c[i, j] = acc
+    end
+    return nothing
+end
+
 # FP8 operands widened to an f32 accumulator, the split the hardware wants.
 function matmul_fp8!(
         a::Tile{F, Tuple{M, K}}, b::Tile{F, Tuple{K, N}}, c::Tile{Float32, Tuple{M, N}}
@@ -273,6 +290,16 @@ end
         z = zeros(Float32, 4, 2)
         run_kernel(matmul!, Tuple{A, B, C}, x, y, z)
         @test z == x * y
+
+        # bf16 operands into an f32 accumulator: the mixed precision the hardware
+        # multiplies. Every value is a small integer, exact in bf16 and in f32.
+        Abf = Tile{BFloat16, Tuple{4, 4}}
+        Cf = Tile{Float32, Tuple{4, 4}}
+        p = BFloat16[i + j for i in 1:4, j in 1:4]
+        q = BFloat16[i - 2j for i in 1:4, j in 1:4]
+        r = zeros(Float32, 4, 4)
+        run_kernel(matmul_mixed!, Tuple{Abf, Abf, Cf}, p, q, r)
+        @test r == Float32.(p) * Float32.(q)
     end
 
     @testset "generated module round-trips" begin

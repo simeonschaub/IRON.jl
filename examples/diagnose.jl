@@ -8,12 +8,20 @@
 #   1. copy, 1-D, i32, 2 FIFOs   -- the reference shape
 #   2. copy, 2-D, f32, 2 FIFOs   -- adds a 2-D memref and a float element type
 #   3. copy, 2-D, f32, 3 FIFOs   -- adds a second input FIFO, unread by the kernel
-#   4. matmul, 2-D, f32, 3 FIFOs -- adds the arithmetic
+#   4. matmul, f32               -- adds the arithmetic
+#   5. matmul, f32               -- and the buffer allocation scheme the matmuls use
+#   6. matmul, i32               -- same loop nest and accumulator, integer multiply
+#   7. matmul, bf16 -> f32       -- float again, in the operand type the MAC has
+#
+# 1-3 moving f32 while 4-5 fail to multiply it is the signature of scalar f32
+# arithmetic on the core, which 6 and 7 separate: 6 keeps the shape and drops the
+# float, 7 keeps the float and changes the operand type.
 #
 # Run against real hardware:
 #   JULIA_PYTHONCALL_EXE=/path/to/mlir-aie/ironenv/bin/python julia --project examples/diagnose.jl
 
 using IRON
+using BFloat16s: BFloat16
 
 const N1 = 1024
 const M = 8
@@ -53,13 +61,29 @@ copy_2d_3fifo!(
 end
 
 matmul!(
-    a::Tile{Float32, Tuple{M, M}}, b::Tile{Float32, Tuple{M, M}},
+    a::Tile{T, Tuple{M, M}}, b::Tile{T, Tuple{M, M}}, c::Tile{T, Tuple{M, M}},
+) where {T} = begin
+    for i in 1:M, j in 1:M
+        acc = zero(T)
+        for k in 1:M
+            acc += a[i, k] * b[k, j]
+        end
+        c[i, j] = acc
+    end
+    nothing
+end
+
+# bf16 operands widened into an f32 accumulator: the (bfloat16, float32) entry of
+# the `_MM_COMBOS` table in aie/iron/kernels/linalg.py, which lists every type
+# combination the accelerator multiplies. There is no f32 x f32 entry.
+matmul_bf16!(
+    a::Tile{BFloat16, Tuple{M, M}}, b::Tile{BFloat16, Tuple{M, M}},
     c::Tile{Float32, Tuple{M, M}},
 ) = begin
     for i in 1:M, j in 1:M
         acc = zero(Float32)
         for k in 1:M
-            acc += a[i, k] * b[k, j]
+            acc += Float32(a[i, k]) * Float32(b[k, j])
         end
         c[i, j] = acc
     end
@@ -108,6 +132,8 @@ end
 
 const Vec32 = Tile{Int32, Tuple{N1}}
 const Mat = Tile{Float32, Tuple{M, M}}
+const MatI = Tile{Int32, Tuple{M, M}}
+const MatBF = Tile{BFloat16, Tuple{M, M}}
 
 a1 = Int32.(1:N1)
 a2 = Float32[10i + j for i in 1:M, j in 1:M]
@@ -118,8 +144,26 @@ b2 = Float32[i - 2j for i in 1:M, j in 1:M]
 stage("1. copy 1-D i32, 2 FIFOs", copy_1d!, DataType[Vec32], Vec32, [a1], a1)
 stage("2. copy 2-D f32, 2 FIFOs", copy_2d!, DataType[Mat], Mat, [a2], a2)
 stage("3. copy 2-D f32, 3 FIFOs", copy_2d_3fifo!, DataType[Mat, Mat], Mat, [a2, b2], a2)
-stage("4. matmul, default alloc", matmul!, DataType[Mat, Mat], Mat, [a2, b2], a2 * b2)
+stage("4. matmul f32, default alloc", matmul!, DataType[Mat, Mat], Mat, [a2, b2], a2 * b2)
 stage(
-    "5. matmul, basic-sequential", matmul!, DataType[Mat, Mat], Mat, [a2, b2], a2 * b2;
+    "5. matmul f32, basic-seq", matmul!, DataType[Mat, Mat], Mat, [a2, b2], a2 * b2;
     aiecc_flags = BUFFER_ALLOC_FIX,
+)
+
+# 6 and 7 ask what the arithmetic in stage 5 is made of. 6 keeps the loop nest and
+# the accumulator but multiplies integers, which the scalar unit certainly does. 7
+# keeps floating point but uses the operand type the hardware has a multiplier for.
+# If 6 passes and 5 does not, the fault is scalar f32 arithmetic on the core.
+i2 = Int32[10i + j for i in 1:M, j in 1:M]
+j2 = Int32[i - 2j for i in 1:M, j in 1:M]
+stage(
+    "6. matmul i32, basic-seq", matmul!, DataType[MatI, MatI], MatI, [i2, j2], i2 * j2;
+    aiecc_flags = BUFFER_ALLOC_FIX,
+)
+
+x2 = BFloat16[10i + j for i in 1:M, j in 1:M]
+y2 = BFloat16[i - 2j for i in 1:M, j in 1:M]
+stage(
+    "7. matmul bf16->f32, basic-seq", matmul_bf16!, DataType[MatBF, MatBF], Mat,
+    [x2, y2], Float32.(x2) * Float32.(y2); aiecc_flags = BUFFER_ALLOC_FIX,
 )
