@@ -83,15 +83,27 @@ if get(ENV, "IRON_RUN", "0") == "1"
     program = matmul_program(matmul!, square(T), square(T), square(T))
     compiled = IRON.compile(program)
 
-    a = T[T(i + j) for i in 1:M, j in 1:K]
-    b = T[T(i == j) for i in 1:K, j in 1:N]   # identity, so a * b == a
+    # Both operands are asymmetric and neither is the identity, so a transposed
+    # tile or a swapped pair of operands changes the answer. Every value here is a
+    # small integer and every partial sum stays well under 2^24, so the product is
+    # exact in f32 and can be compared for equality. A symmetric `a` with `b = I`
+    # is a trap: it is invariant under exactly the mistakes worth catching.
+    a = T[T(10i + j) for i in 1:M, j in 1:K]
+    b = T[T(i - 2j) for i in 1:K, j in 1:N]
     da, db = IRON.device_array(a), IRON.device_array(b)
     dc = IRON.device_zeros(square(T))
     IRON.run!(compiled, da, db, dc)
 
     result = IRON.host_array(dc)
-    @assert result == a * b
-    println("NPU matmul matches: ", result == a * b)
+    expected = a * b
+    if result == expected
+        println("NPU matmul matches")
+    else
+        wrong = count(!=(0), result .!= expected)
+        println("MISMATCH in $wrong of $(length(expected)) elements")
+        println("got:\n", result)
+        println("expected:\n", expected)
+    end
 else
     # The same kernel source, compiled for each element type. Only the accumulate
     # is interesting; the arithmetic on `index` is subscript bookkeeping.

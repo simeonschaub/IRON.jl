@@ -45,20 +45,26 @@ consumer(fifo::ObjectFifo{T}) where {T} = Endpoint{T}(fifo, Consume)
 tiletype(::Endpoint{T}) where {T} = T
 
 """
-    Worker(kernel, endpoints)
+    Worker(kernel, endpoints; stack_size=1024)
 
 A program for one compute tile. On every iteration it acquires one tile from each
 endpoint, calls `kernel` with them, and releases them.
 
 `kernel` is a Julia function taking one [`Tile`](@ref) per endpoint, in order, and
 returning `nothing`; it is compiled to MLIR and inlined into the core body.
+
+`stack_size` is the core's stack, in bytes; the default matches Python IRON's. The
+stack shares the tile's memory with the object FIFO buffers, so a kernel that
+spills more than it reserves corrupts them rather than failing outright.
 """
 struct Worker{F}
     kernel::F
     endpoints::Vector{Endpoint}
+    stack_size::Int
 end
 
-Worker(kernel, endpoints::AbstractVector) = Worker(kernel, Vector{Endpoint}(endpoints))
+Worker(kernel, endpoints::AbstractVector; stack_size::Integer = 1024) =
+    Worker(kernel, Vector{Endpoint}(endpoints), Int(stack_size))
 
 """
     Runtime()
@@ -295,7 +301,10 @@ function generate_mlir(p::Program; ctx::IR.Context = context())
     end
 
     for (w, tile) in zip(p.runtime.workers, core_tiles)
-        push!(device_body, core_op(ctx, tile, emit_core_body!(ctx, w)))
+        push!(
+            device_body,
+            core_op(ctx, tile, emit_core_body!(ctx, w); stack_size = w.stack_size),
+        )
     end
 
     push!(device_body, emit_runtime_sequence!(ctx, p))
