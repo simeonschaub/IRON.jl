@@ -174,20 +174,29 @@ end
 
 # `aie.dma_bd`: one buffer descriptor. `dims` is a list of (size, stride) pairs,
 # outermost first, describing the access pattern over `buffer`.
+#
+# Since mlir-aie #3306 the op takes offset/len/sizes/strides as SSA operands via a
+# DynamicIndexList. IRON only ever needs static values, so they go in the
+# `static_*` attributes and the buffer is the sole operand -- hence
+# `operandSegmentSizes = [1, 0, 0, 0, 0]` over the (buffer, offset, len, sizes,
+# strides) segments. Sizes/strides are emitted only for an actual n-d pattern; a
+# plain contiguous transfer is just offset+len.
 function dma_bd_op(
         ctx, buffer::IR.Value, dims::Vector{Tuple{Int, Int}}, len::Integer; offset::Integer = 0,
     )
-    dims_str = join(("<size = $(s), stride = $(t)>" for (s, t) in dims), ", ")
-    return create_op(
-        "aie.dma_bd", loc(ctx);
-        operands = IR.Value[buffer],
-        properties = [
-            "burst_length" => i32(0, ctx),
-            "dimensions" => opaque_attr("#aie<bd_dim_layout_array[$dims_str]>"; context = ctx),
-            "len" => i32(len, ctx),
-            "offset" => i32(offset, ctx),
-        ],
-    )
+    props = Pair{String, IR.Attribute}[
+        "operandSegmentSizes" => opaque_attr("array<i32: 1, 0, 0, 0, 0>"; context = ctx),
+        "burst_length" => i32(0, ctx),
+        "static_offset" => i32(offset, ctx),
+        "static_len" => i32(len, ctx),
+    ]
+    if !isempty(dims)
+        sizes = join((s for (s, _) in dims), ", ")
+        strides = join((t for (_, t) in dims), ", ")
+        push!(props, "static_sizes" => opaque_attr("array<i64: $sizes>"; context = ctx))
+        push!(props, "static_strides" => opaque_attr("array<i64: $strides>"; context = ctx))
+    end
+    return create_op("aie.dma_bd", loc(ctx); operands = IR.Value[buffer], properties = props)
 end
 
 for (jl_name, op_name) in (
