@@ -24,7 +24,7 @@ each one adapts to the kernel's [`Tile`](@ref) view via `Adapt.adapt`.
 
 Scalar indexing is disallowed by default -- touching one element still crosses to
 the host and back through the Python/XRT stack -- so wrap any deliberate scalar
-access in [`@allowscalar`](@ref).
+access in `@allowscalar` (re-exported from GPUArraysCore).
 """
 struct NPUArray{T, N} <: AbstractGPUArray{T, N}
     buf::Py
@@ -114,6 +114,7 @@ Base.show(io::IO, a::NPUArray{T, N}) where {T, N} =
 function Base.show(io::IO, ::MIME"text/plain", a::NPUArray{T}) where {T}
     print(io, join(size(a), "×"), " NPUArray{", T, "} (device-resident; ")
     print(io, "Array(x) to copy to host)")
+    return nothing
 end
 
 # --- Adapt: launch-argument conversion (NPUArray -> Tile) --------------------
