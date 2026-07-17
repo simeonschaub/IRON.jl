@@ -63,6 +63,22 @@ IRON.run!(compiled, a, b)
 IRON.host_array(b) == Int32.(1:1024)
 ```
 
+Keyword arguments to `compile` are forwarded to `aie.iron.jit`. One of them is
+worth knowing about before it costs you a day:
+
+```julia
+compiled = IRON.compile(program; aiecc_flags = ["--alloc-scheme=basic-sequential"])
+```
+
+Buffer allocation defaults to bank-aware, falling back to basic-sequential only
+when bank-aware *reports* failure. For a design with several object FIFOs on one
+core it does not report failure -- it produces an allocation whose buffers
+overlap, and the design runs, and returns an output tile holding an input's
+bytes. Every matrix multiply under `programming_examples/` passes this flag, as
+does `examples/matmul.jl`. If a design compiles and runs but returns data that
+looks like one of its inputs, try this first; `examples/diagnose.jl` runs the
+same matmul with and without it.
+
 ## How kernels are compiled
 
 `Tile{T,Dims}` is an empty marker type standing for a `memref<...>`. It is never

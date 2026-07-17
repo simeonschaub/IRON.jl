@@ -81,7 +81,13 @@ if get(ENV, "IRON_RUN", "0") == "1"
     # Needs an NPU, XRT and the MLIR-AIE toolchain.
     T = Float32
     program = matmul_program(matmul!, square(T), square(T), square(T))
-    compiled = IRON.compile(program)
+
+    # Buffer allocation defaults to bank-aware, falling back to basic-sequential
+    # only when bank-aware reports failure. With three object FIFOs on one core it
+    # does not report failure -- it produces an allocation whose buffers overlap,
+    # and C comes back holding A's bytes. Every matrix multiply under
+    # programming_examples/ passes this same flag.
+    compiled = IRON.compile(program; aiecc_flags = ["--alloc-scheme=basic-sequential"])
 
     # Both operands are asymmetric and neither is the identity, so a transposed
     # tile or a swapped pair of operands changes the answer. Every value here is a
