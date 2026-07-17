@@ -39,7 +39,10 @@ using MLIR.Dialects: arith, scf, memref
 using IRStructurizer
 using PythonCall
 
+const CC = Core.Compiler
+
 include("context.jl")
+include("interpreter.jl")
 include("tile.jl")
 include("dialects.jl")
 include("kernel.jl")

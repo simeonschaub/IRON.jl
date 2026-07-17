@@ -7,7 +7,7 @@
 function mlir_type(ctx::IR.Context, T)
     T === Int && return IR.IndexType(; context = ctx)
     T <: Tile && return memref_type(ctx, T)
-    return IR.Type(T; context = ctx)
+    return mlir_eltype(ctx, T)
 end
 
 # Julia intrinsic => (MLIR builder, cmpi predicate or nothing).
@@ -74,12 +74,21 @@ function lookup!(kc::KernelContext, block::IR.Block, v)
         error("IRON: cannot materialize $(repr(v))::$(typeof(v)) as an MLIR value")
     key = (typeof(v), v)
     haskey(kc.constants, key) && return kc.constants[key]
-    type = mlir_type(kc.ctx, typeof(v))
-    op = arith.constant(; value = IR.Attribute(v, type), location = loc(kc.ctx))
+    op = arith.constant(; value = float_or_int_attr(kc.ctx, v), location = loc(kc.ctx))
     push!(block, op)
     result = IR.result(op, 1)
     kc.constants[key] = result
     return result
+end
+
+# MLIR.jl's float attribute constructor derives the MLIR type from the Julia type
+# itself, which does not reach the element types `mlir_eltype` adds (FP8 among
+# them), so the attribute is built against an explicit type instead. MLIR rounds
+# the double to the target format.
+function float_or_int_attr(ctx::IR.Context, v)
+    type = mlir_type(ctx, typeof(v))
+    v isa AbstractFloat || return IR.Attribute(v, type)
+    return IR.Attribute(API.mlirFloatAttrDoubleGet(ctx, type, Float64(v)))
 end
 
 # Tiles are indexed from 1 like any Julia array, memrefs from 0, so every subscript
@@ -95,6 +104,31 @@ function memref_index!(kc::KernelContext, block::IR.Block, index)
     result = IR.result(op, 1)
     kc.indices[index] = result
     return result
+end
+
+# One subscript per memref dimension, each lowered from 1-based to 0-based. The
+# arity check is here because MLIR's own diagnostic for it arrives much later, from
+# the module verifier, and does not mention the kernel.
+function subscripts!(kc::KernelContext, block::IR.Block, tile::IR.Value, indices)
+    rank = Int(API.mlirShapedTypeGetRank(IR.type(tile)))
+    length(indices) == rank || error(
+        "IRON: a $(rank)-dimensional tile takes $rank subscripts, got $(length(indices))"
+    )
+    return IR.Value[memref_index!(kc, block, i) for i in indices]
+end
+
+# `arith.extf` widens and `arith.truncf` narrows; MLIR has no single float cast, and
+# each rejects the other's direction. The direction is decided from the Julia types,
+# since MLIR's C API exposes a width query for integers but not for floats.
+function emit_convert!(
+        kc::KernelContext, block::IR.Block, ssa, source::IR.Value, from::Type, to::Type
+    )
+    from === to && return (kc.values[ssa] = source; nothing)
+    builder = bitwidth(to) > bitwidth(from) ? arith.extf : arith.truncf
+    op = builder(source; out = mlir_type(kc.ctx, to), location = loc(kc.ctx))
+    push!(block, op)
+    kc.values[ssa] = IR.result(op, 1)
+    return nothing
 end
 
 function emit_call!(kc::KernelContext, block::IR.Block, jblock, inst)
@@ -113,9 +147,9 @@ function emit_call!(kc::KernelContext, block::IR.Block, jblock, inst)
 
     if fn === Base.getindex
         tile = lookup!(kc, block, ops[1])
-        index = memref_index!(kc, block, ops[2])
+        indices = subscripts!(kc, block, tile, @view ops[2:end])
         op = memref.load(
-            tile, IR.Value[index];
+            tile, indices;
             result = mlir_type(kc.ctx, inst[:type]), location = loc(kc.ctx),
         )
         push!(block, op)
@@ -126,9 +160,17 @@ function emit_call!(kc::KernelContext, block::IR.Block, jblock, inst)
     if fn === Base.setindex!
         tile = lookup!(kc, block, ops[1])
         value = lookup!(kc, block, ops[2])
-        index = memref_index!(kc, block, ops[3])
-        push!(block, memref.store(value, tile, IR.Value[index]; location = loc(kc.ctx)))
+        indices = subscripts!(kc, block, tile, @view ops[3:end])
+        push!(block, memref.store(value, tile, indices; location = loc(kc.ctx)))
         return nothing
+    end
+
+    if fn === convert_float
+        # The target is the second argument, a type rather than a value, so it is
+        # read off the inferred result type instead of the operand list.
+        source = lookup!(kc, block, ops[1])
+        from = IRStructurizer.value_type(jblock, ops[1])
+        return emit_convert!(kc, block, ssa, source, from, inst[:type])
     end
 
     entry = get(ARITH_OPS, fn, nothing)
@@ -257,12 +299,16 @@ the point of use rather than emitted as a separate function.
 
 Only kernels returning `nothing` are supported: a kernel communicates through the
 tiles it writes.
+
+Inference runs under [`IRONInterpreter`](@ref), so the kernel is inferred against
+device semantics -- notably, FP8 conversions stay single operations instead of
+expanding into the software implementations their packages provide.
 """
 function compile_kernel!(
         ctx::IR.Context, block::IR.Block, @nospecialize(f), @nospecialize(argtypes),
         args::Vector{IR.Value},
     )
-    results = IRStructurizer.code_structured(f, argtypes)
+    results = IRStructurizer.code_structured(f, argtypes; interp = IRONInterpreter())
     length(results) == 1 ||
         error("IRON: expected exactly one method of $f for $argtypes, found $(length(results))")
     sci, rettype = only(results)

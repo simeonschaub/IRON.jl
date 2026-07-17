@@ -82,6 +82,50 @@ floating-point arithmetic on tile elements (see `ARITH_OPS` in `src/kernel.jl`).
 Kernels must return `nothing` and communicate through the tiles they write. A
 call with no registered lowering is an error rather than a silently wrong kernel.
 
+## Element types
+
+A kernel is generic in its element type: `examples/matmul.jl` writes one
+`matmul!` and compiles it for each of
+
+| Julia | MLIR | multiply-accumulate |
+|---|---|---|
+| `Int32` | `i32` | `arith.muli` / `arith.addi` |
+| `Float16` | `f16` | `arith.mulf` / `arith.addf` |
+| `BFloat16` | `bf16` | `arith.mulf` / `arith.addf` |
+| `Float32` | `f32` | `arith.mulf` / `arith.addf` |
+| `Float8_E4M3FN`, `Float8_E5M2` | `f8E4M3FN`, `f8E5M2` | storage only -- see below |
+
+The first four need nothing special: Julia lowers their arithmetic to intrinsics
+already, `BFloat16` included, because LLVM has all four natively.
+
+The FP8 formats are different, in a way worth knowing about. Their Julia
+packages implement arithmetic and conversion in software, since a CPU has no
+FP8, so inferring a kernel against those methods buries one hardware conversion
+under a few hundred integer ops. IRON therefore infers kernels under its own
+`AbstractInterpreter` with an overlay method table (`src/interpreter.jl`) that
+replaces just the FP8 conversions with an intrinsic, leaving everything else
+alone. `Float32(a[i, k])` then emits one `arith.extf`.
+
+FP8 arithmetic itself is deliberately not overlaid. The hardware computes in f16
+or f32 and uses FP8 as a storage format, which is the split cuTile makes too, so
+a kernel converts on load and accumulates in a wider type:
+
+```julia
+function matmul_fp8!(a::Tile{Float8_E4M3FN,...}, b::..., c::Tile{Float32,...})
+    acc = zero(Float32)
+    for k in 1:K
+        acc += Float32(a[i, k]) * Float32(b[k, j])   # arith.extf, then f32 math
+    end
+end
+```
+
+FP8 comes from either [DLFP8Types](https://github.com/chengchingwen/DLFP8Types.jl)
+or [Microfloats](https://github.com/JuliaMath/Microfloats.jl), attached through
+package extensions in `ext/`. Add an element type by overloading `mlir_eltype`,
+and `bitwidth` too if it is sub-byte. Formats MLIR 18 lacks (the FNUZ variants,
+`Float8_E8M0FNU`, `Float6_*`, `Float4_*`) raise an unsupported-type error rather
+than being mapped onto a neighbouring format.
+
 ## The aie dialect
 
 MLIR.jl links against upstream MLIR, which has no `aie`/`aiex` dialect. Rather

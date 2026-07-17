@@ -8,8 +8,18 @@ IRStructurizer = "93e32bba-5bb8-402b-805d-ffb066edee93"
 MLIR = "bfde9dd4-8f40-4a1e-be09-1475335e1c92"
 PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
 
+[weakdeps]
+DLFP8Types = "f4c16678-4a16-415b-82ef-ed337c5d6c7c"
+Microfloats = "31c70f10-a750-4521-b13c-797315ae2933"
+
+[extensions]
+IRONDLFP8TypesExt = "DLFP8Types"
+IRONMicrofloatsExt = "Microfloats"
+
 [compat]
+DLFP8Types = "0.1"
 IRStructurizer = "0.6"
 MLIR = "0.2"
+Microfloats = "0.2"
 PythonCall = "0.9"
-julia = "1.10"
+julia = "1.11"

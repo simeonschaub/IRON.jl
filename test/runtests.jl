@@ -2,9 +2,47 @@ using IRON
 using IRON: Tile, compile_kernel!, context, memref_type, objectfifo_type, region
 using MLIR: IR
 using MLIR.Dialects: func
+using BFloat16s: BFloat16
+using DLFP8Types: Float8_E4M3FN, Float8_E5M2
 using Test
 
 const Buf = Tile{Int32, Tuple{1024}}
+
+# Kernels shared by the matmul testsets.
+function matmul!(
+        a::Tile{T, Tuple{M, K}}, b::Tile{T, Tuple{K, N}}, c::Tile{T, Tuple{M, N}}
+    ) where {T, M, K, N}
+    for i in 1:M, j in 1:N
+        acc = zero(T)
+        for k in 1:K
+            acc += a[i, k] * b[k, j]
+        end
+        c[i, j] = acc
+    end
+    return nothing
+end
+
+# FP8 operands widened to an f32 accumulator, the split the hardware wants.
+function matmul_fp8!(
+        a::Tile{F, Tuple{M, K}}, b::Tile{F, Tuple{K, N}}, c::Tile{Float32, Tuple{M, N}}
+    ) where {F, M, K, N}
+    for i in 1:M, j in 1:N
+        acc = zero(Float32)
+        for k in 1:K
+            acc += Float32(a[i, k]) * Float32(b[k, j])
+        end
+        c[i, j] = acc
+    end
+    return nothing
+end
+
+# Too few subscripts for the tile's rank.
+function bad_rank(a::Tile{Float32, Tuple{4, 4}}, b::Tile{Float32, Tuple{4, 4}})
+    for i in 1:4
+        b[i, i] = a[i]
+    end
+    return nothing
+end
 
 # The design from examples/add_one.jl, which mirrors the Python IRON example that
 # the reference generic.mlir was generated from.
@@ -141,6 +179,73 @@ end
         # The kernel is inlined into the core rather than called.
         @test occursin("aie.core", mlir)
         @test occursin("memref.load", mlir)
+    end
+
+    @testset "matmul over element types" begin
+        # One generic kernel, instantiated per element type: the arithmetic op and
+        # its MLIR type follow the tile's element type with no per-type code.
+        cases = (
+            Int32 => ("arith.muli", "arith.addi", "i32"),
+            Float16 => ("arith.mulf", "arith.addf", "f16"),
+            BFloat16 => ("arith.mulf", "arith.addf", "bf16"),
+            Float32 => ("arith.mulf", "arith.addf", "f32"),
+            Float64 => ("arith.mulf", "arith.addf", "f64"),
+        )
+        for (T, (mul, add, mlir_ty)) in cases
+            S = Tile{T, Tuple{4, 4}}
+            ir = lower(matmul!, Tuple{S, S, S})
+            @test occursin("memref<4x4x$mlir_ty>", ir)
+            @test occursin("$mul %", ir)
+            @test occursin("$add %", ir)
+            # The accumulator is carried by the k loop rather than through memory.
+            @test occursin(Regex("scf\\.for.*iter_args.*-> \\($mlir_ty"), ir)
+        end
+    end
+
+    @testset "multi-dimensional indexing" begin
+        ir = lower(
+            matmul!, Tuple{
+                Tile{Float32, Tuple{4, 8}}, Tile{Float32, Tuple{8, 2}}, Tile{Float32, Tuple{4, 2}},
+            }
+        )
+        # Two subscripts per access, and the non-square shapes stay distinct.
+        @test occursin(r"memref\.load %\w+\[%\w+, %\w+\] : memref<4x8xf32>", ir)
+        @test occursin(r"memref\.load %\w+\[%\w+, %\w+\] : memref<8x2xf32>", ir)
+        # The stored value is `%N#0`: the accumulator comes out of the k loop, which
+        # carries more than one result.
+        @test occursin(r"memref\.store %[\w#]+, %\w+\[%\w+, %\w+\] : memref<4x2xf32>", ir)
+
+        @test_throws "takes 2 subscripts, got 1" lower(
+            bad_rank, Tuple{Tile{Float32, Tuple{4, 4}}, Tile{Float32, Tuple{4, 4}}}
+        )
+    end
+
+    @testset "FP8 formats" begin
+        ctx = context()
+        @test string(IRON.mlir_eltype(ctx, Float8_E4M3FN)) == "f8E4M3FN"
+        @test string(IRON.mlir_eltype(ctx, Float8_E5M2)) == "f8E5M2"
+
+        for F in (Float8_E4M3FN, Float8_E5M2)
+            ir = lower(
+                matmul_fp8!, Tuple{
+                    Tile{F, Tuple{2, 2}}, Tile{F, Tuple{2, 2}}, Tile{Float32, Tuple{2, 2}},
+                }
+            )
+            mlir_ty = string(IRON.mlir_eltype(ctx, F))
+            @test occursin("memref<2x2x$mlir_ty>", ir)
+
+            # Each operand widens in exactly one op. Without the overlay method
+            # table, inference sees the package's software conversion instead and
+            # buries this under a few hundred integer ops.
+            @test count("arith.extf", ir) == 2
+            @test occursin("arith.extf %", ir)
+            @test occursin(" $mlir_ty to f32", ir)
+            @test !occursin("arith.bitcast", ir)
+
+            # FP8 is storage only: the arithmetic happens in f32.
+            @test occursin("arith.mulf %", ir)
+            @test occursin(": f32", ir)
+        end
     end
 
     @testset "generated module round-trips" begin
