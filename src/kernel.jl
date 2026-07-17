@@ -7,7 +7,19 @@
 function mlir_type(ctx::IR.Context, T)
     T === Int && return IR.IndexType(; context = ctx)
     T <: Tile && return memref_type(ctx, T)
+    T <: Vec && return vector_type(ctx, T)
     return mlir_eltype(ctx, T)
+end
+
+"""
+    vector_type(ctx, ::Type{Vec{N,T}}) -> IR.Type
+
+The `vector<NxT>` a `SIMD.Vec` lowers to.
+"""
+function vector_type(ctx::IR.Context, ::Type{Vec{N, T}}) where {N, T}
+    return IR.Type(
+        API.mlirVectorTypeGet(1, Int64[N], mlir_eltype(ctx, T))
+    )
 end
 
 # Julia intrinsic => (MLIR builder, cmpi predicate or nothing).
@@ -148,6 +160,85 @@ function emit_convert!(
     return nothing
 end
 
+# Elementwise vector arithmetic is `arith` over a vector type, not a separate
+# dialect: `arith.mulf %a, %b : vector<8xf32>` is what convert-vector-to-aievec
+# turns into an `aievec.mul_elem`.
+const VECTOR_OPS = Dict{Any, Any}(
+    vadd => (arith.addf, arith.addi),
+    vsub => (arith.subf, arith.subi),
+    vmul => (arith.mulf, arith.muli),
+    vdiv => (arith.divf, arith.divsi),
+)
+
+function emit_vector!(kc::KernelContext, block::IR.Block, jblock, inst, fn, ops, ssa)
+    ctx = kc.ctx
+    result = () -> mlir_type(ctx, inst[:type])
+
+    if fn === vload
+        # The element type is the first argument, a type rather than a value.
+        tile = lookup!(kc, block, ops[2])
+        indices = subscripts!(kc, block, tile, @view ops[3:end])
+        op = vector.load(tile, indices; result = result(), location = loc(ctx))
+        push!(block, op)
+        kc.values[ssa] = IR.result(op, 1)
+        return nothing
+    end
+
+    if fn === vstore!
+        value = lookup!(kc, block, ops[1])
+        tile = lookup!(kc, block, ops[2])
+        indices = subscripts!(kc, block, tile, @view ops[3:end])
+        push!(block, vector.store(value, tile, indices; location = loc(ctx)))
+        return nothing
+    end
+
+    if fn === vbroadcast
+        source = lookup!(kc, block, ops[2])
+        op = vector.broadcast(source; vector = result(), location = loc(ctx))
+        push!(block, op)
+        kc.values[ssa] = IR.result(op, 1)
+        return nothing
+    end
+
+    if fn === vreduce_add
+        source = lookup!(kc, block, ops[1])
+        op = vector.reduction(
+            source; dest = result(), kind = IR.Attribute("add"; context = ctx),
+            location = loc(ctx),
+        )
+        push!(block, op)
+        kc.values[ssa] = IR.result(op, 1)
+        return nothing
+    end
+
+    if fn === vfma
+        a, b, c = (lookup!(kc, block, o) for o in ops)
+        if eltype(inst[:type]) <: AbstractFloat
+            op = vector.fma(a, b, c; result = result(), location = loc(ctx))
+            push!(block, op)
+        else
+            # vector.fma is floating-point only, so an integer multiply-accumulate
+            # is spelled out. The two ops fuse again downstream.
+            mul = arith.muli(a, b; result = result(), location = loc(ctx))
+            push!(block, mul)
+            op = arith.addi(
+                IR.result(mul, 1), c; result = result(), location = loc(ctx)
+            )
+            push!(block, op)
+        end
+        kc.values[ssa] = IR.result(op, 1)
+        return nothing
+    end
+
+    float_op, int_op = VECTOR_OPS[fn]
+    builder = eltype(inst[:type]) <: AbstractFloat ? float_op : int_op
+    args = IR.Value[lookup!(kc, block, o) for o in ops]
+    op = builder(args...; result = result(), location = loc(ctx))
+    push!(block, op)
+    kc.values[ssa] = IR.result(op, 1)
+    return nothing
+end
+
 function emit_call!(kc::KernelContext, block::IR.Block, jblock, inst)
     resolved = IRStructurizer.resolve_call(jblock, inst)
     resolved === nothing && return nothing
@@ -188,6 +279,10 @@ function emit_call!(kc::KernelContext, block::IR.Block, jblock, inst)
         source = lookup!(kc, block, ops[1])
         from = IRStructurizer.value_type(jblock, ops[1])
         return emit_convert!(kc, block, ssa, source, from, inst[:type])
+    end
+
+    if fn in (vload, vstore!, vbroadcast, vreduce_add, vfma) || haskey(VECTOR_OPS, fn)
+        return emit_vector!(kc, block, jblock, inst, fn, ops, ssa)
     end
 
     builder = get(CONVERT_OPS, fn, nothing)

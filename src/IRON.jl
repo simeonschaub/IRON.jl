@@ -35,7 +35,7 @@ println(generate_mlir(program))
 module IRON
 
 using MLIR: IR, API
-using MLIR.Dialects: arith, scf, memref
+using MLIR.Dialects: arith, scf, memref, vector
 using IRStructurizer
 using PythonCall
 
@@ -44,12 +44,14 @@ const CC = Core.Compiler
 include("context.jl")
 include("interpreter.jl")
 include("tile.jl")
+include("simd.jl")
 include("dialects.jl")
 include("kernel.jl")
 include("design.jl")
 include("runtime.jl")
 
 export Tile
+export vload, vstore!
 export AIEDevice, npu1, npu2
 export ObjectFifo, Endpoint, producer, consumer
 export Worker, Runtime, start!, drain!, Program

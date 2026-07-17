@@ -3,6 +3,7 @@ using IRON: Tile, compile_kernel!, context, memref_type, objectfifo_type, region
 using MLIR: IR
 using MLIR.Dialects: func
 using BFloat16s: BFloat16
+using SIMD: Vec
 using DLFP8Types: Float8_E4M3FN, Float8_E5M2
 using Test
 
@@ -49,6 +50,21 @@ function matmul_fp8!(
             acc += Float32(a[i, k]) * Float32(b[k, j])
         end
         c[i, j] = acc
+    end
+    return nothing
+end
+
+# One output row per vector: broadcast an element of `a`, read the matching row of
+# `b`, multiply-accumulate. The shape aie::mmul has.
+function matmul_vec!(
+        a::Tile{T, Tuple{M, K}}, b::Tile{T, Tuple{K, N}}, c::Tile{T, Tuple{M, N}}
+    ) where {T, M, K, N}
+    for i in 1:M
+        acc = zero(Vec{N, T})
+        for k in 1:K
+            acc = muladd(Vec{N, T}(a[i, k]), vload(Vec{N, T}, b, k, 1), acc)
+        end
+        vstore!(acc, c, i, 1)
     end
     return nothing
 end
@@ -300,6 +316,52 @@ end
         r = zeros(Float32, 4, 4)
         run_kernel(matmul_mixed!, Tuple{Abf, Abf, Cf}, p, q, r)
         @test r == Float32.(p) * Float32.(q)
+    end
+
+    @testset "vector kernels" begin
+        # 16 lanes: convert-vector-to-aievec lowers vector.fma only for f32 at 16
+        # lanes and bf16 at 16 or 32, matching AIE2's 512-bit vector registers.
+        S = Tile{Float32, Tuple{16, 16}}
+        ir = lower(matmul_vec!, Tuple{S, S, S})
+
+        # The vector dialect is what convert-vector-to-aievec ingests; these four
+        # ops are the whole interface to the AIE vector unit.
+        @test occursin("vector.broadcast %", ir)
+        @test occursin(r"vector\.load .*vector<16xf32>", ir)
+        @test occursin(r"vector\.fma .*: vector<16xf32>", ir)
+        @test occursin(r"vector\.store .*vector<16xf32>", ir)
+
+        # The accumulator stays in a vector register across the k loop.
+        @test occursin(r"scf\.for.*iter_args.*-> \(vector<16xf32>", ir)
+
+        # They must be registered ops, not unregistered ones that happen to print:
+        # the generic form is the tell, and it reaches aiecc as something no
+        # pattern matches.
+        @test !occursin("\"vector.fma\"", ir)
+
+        # vector.fma is floating-point only, so integers spell the MAC out.
+        I = Tile{Int32, Tuple{16, 16}}
+        int_ir = lower(matmul_vec!, Tuple{I, I, I})
+        @test !occursin("vector.fma", int_ir)
+        @test occursin(r"arith\.muli .*: vector<16xi32>", int_ir)
+        @test occursin(r"arith\.addi .*: vector<16xi32>", int_ir)
+    end
+
+    @testset "vector kernels compute the right answer" begin
+        # Run it, rather than trust that vector.fma means what it reads like.
+        S = Tile{Float32, Tuple{16, 16}}
+        x = Float32[10i + j for i in 1:16, j in 1:16]
+        y = Float32[i - 2j for i in 1:16, j in 1:16]
+        z = zeros(Float32, 16, 16)
+        run_kernel(matmul_vec!, Tuple{S, S, S}, x, y, z)
+        @test z == x * y
+
+        I = Tile{Int32, Tuple{16, 16}}
+        p = Int32[10i + j for i in 1:16, j in 1:16]
+        q = Int32[i - 2j for i in 1:16, j in 1:16]
+        r = zeros(Int32, 16, 16)
+        run_kernel(matmul_vec!, Tuple{I, I, I}, p, q, r)
+        @test r == p * q
     end
 
     @testset "generated module round-trips" begin

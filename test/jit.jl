@@ -72,8 +72,9 @@ function jit_kernel(@nospecialize(f), @nospecialize(argtypes))
     pm = IR.PassManager(; context = ctx)
     IR.add_pipeline!(
         IR.OpPassManager(pm),
-        "convert-scf-to-cf,convert-cf-to-llvm,convert-arith-to-llvm," *
-            "finalize-memref-to-llvm,convert-func-to-llvm,reconcile-unrealized-casts",
+        "convert-scf-to-cf,convert-cf-to-llvm,convert-vector-to-llvm," *
+            "convert-arith-to-llvm,finalize-memref-to-llvm,convert-func-to-llvm," *
+            "reconcile-unrealized-casts",
     )
     IR.run!(pm, mod)
 

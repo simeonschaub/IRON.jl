@@ -134,11 +134,45 @@ Measured on an NPU2, with `examples/diagnose.jl`:
 Moving floats is fine; multiplying them scalar-wise on the core is not, and it
 fails silently rather than refusing to compile. The bf16 case fails for the same
 reason -- widening on load is one `arith.extf`, but the accumulate is still scalar
-f32. So today a pure-Julia kernel that computes should use integers;
-`examples/matmul.jl` runs the i32 design for that reason. Real float throughput
-lives in the vector unit (`aie::mmul`), which this package does not reach yet --
-that needs the `aievec` dialect and the pre-tiled `dims_to_stream` layouts the
-reference kernels use.
+f32. So a scalar kernel that computes should use integers, which is why
+`examples/matmul.jl` runs the i32 design.
+
+Float throughput lives in the vector unit, and that is reachable -- see below.
+
+## Vector kernels
+
+`aiecc` runs `convert-vector-to-aievec` over every AIE2/AIE2p core, and that
+pipeline "ingests arbitrary MLIR Vector code". So the way to the vector unit is
+the standard `vector` dialect; nothing here emits `aievec` directly:
+
+```
+vector.fma  ->  aievec.mac_elem  ->  the MAC intrinsic aie::mmul uses
+```
+
+A kernel says that with `SIMD.Vec{N,T}` (`examples/matmul_vectorized.jl`):
+
+```julia
+for i in 1:M
+    acc = zero(Vec{N,T})                                     # stays in a register
+    for k in 1:K
+        acc = muladd(Vec{N,T}(a[i,k]),                       # vector.broadcast
+                     vload(Vec{N,T}, b, k, 1), acc)          # vector.load + vector.fma
+    end
+    vstore!(acc, c, i, 1)                                    # vector.store
+end
+```
+
+**The vector width is the hardware's, not the matrix's.** `convert-vector-to-aievec`
+lowers `vector.fma` only for f32 at 16 lanes, and bf16 at 16 or 32 -- AIE2's vector
+registers are 512 bits. A `vector<8xf32>` matches no pattern, and aiecc stops with
+`failed to legalize operation 'vector.fma'`. `vector.fma` is also floating-point
+only, so an integer multiply-accumulate lowers to `arith.muli` + `arith.addi` over
+vectors instead.
+
+SIMD.jl's arithmetic would normally inline to `llvmcall` carrying a literal LLVM IR
+string, which means nothing here, so the overlay method table redirects the
+operators to intrinsics before that happens -- the same mechanism as the FP8
+conversions.
 
 The FP8 formats are different, in a way worth knowing about. Their Julia
 packages implement arithmetic and conversion in software, since a CPU has no
