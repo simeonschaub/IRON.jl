@@ -248,6 +248,33 @@ end
         end
     end
 
+    @testset "kernels compute the right answer" begin
+        include("jit.jl")
+
+        # add_one, run rather than read.
+        a = Int32.(1:1024)
+        b = zeros(Int32, 1024)
+        run_kernel(add_one, Tuple{Buf, Buf}, a, b)
+        @test b == a .+ Int32(1)
+
+        # matmul: asymmetric operands, neither one the identity, so a transposed
+        # tile or a swapped operand pair changes the answer. Exact in f32.
+        S = Tile{Float32, Tuple{8, 8}}
+        x = Float32[10i + j for i in 1:8, j in 1:8]
+        y = Float32[i - 2j for i in 1:8, j in 1:8]
+        z = zeros(Float32, 8, 8)
+        run_kernel(matmul!, Tuple{S, S, S}, x, y, z)
+        @test z == x * y
+
+        # Non-square, so a swapped pair of subscripts cannot go unnoticed.
+        A, B, C = Tile{Float32, Tuple{4, 8}}, Tile{Float32, Tuple{8, 2}}, Tile{Float32, Tuple{4, 2}}
+        x = Float32[i + 2j for i in 1:4, j in 1:8]
+        y = Float32[3i - j for i in 1:8, j in 1:2]
+        z = zeros(Float32, 4, 2)
+        run_kernel(matmul!, Tuple{A, B, C}, x, y, z)
+        @test z == x * y
+    end
+
     @testset "generated module round-trips" begin
         # Re-parsing the text is the closest check available without the toolchain to
         # what aie-opt does first: syntax, types and attributes must all be valid.
