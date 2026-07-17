@@ -164,8 +164,15 @@ for i in 1:M
 end
 ```
 
-Two rules shape that, and both fail loudly rather than silently, which is a
-welcome change:
+Measured on an NPU2 with `examples/matmul_vectorized.jl`, `BFloat16 -> Float32`
+**passes**: a pure-Julia matmul running on the AIE vector unit, through the same
+`aievec.mac_elem` the C++ kernels reach via `aie::mmul`. That is the one
+combination the MAC is built out of. `Int16 -> Int32` stops in peano (`unable to
+legalize <16 x s32> G_MUL` -- the MAC widens i16 internally, so there is no i32
+vector multiply for an aievec op to sit on), and FP8 stops in aiecc.
+
+Two rules shape the kernel, and both fail loudly rather than silently, which is a
+welcome change after the scalar path:
 
 **The vector width is the hardware's, not the algorithm's.** `vector.fma` lowers
 only for f32 at 16 lanes, and bf16 at 16 or 32 -- AIE2's vector registers are 512
@@ -181,6 +188,13 @@ operands are bf16 and the accumulator is f32, and `Vec{N,Float32}(av)` is the
 
 `vector.fma` is floating-point only, so an integer multiply-accumulate lowers to
 `arith.muli` + `arith.addi` over vectors instead, which need no widening.
+
+**Widen the vectors, never the scalar.** Both MAC patterns want "widening ops in
+the `lhs` and `rhs` operands", so each must be an `arith.extf`/`extsi` over a
+vector. Broadcasting `a[i,k]` straight into the accumulator's type widens the
+scalar and then splats it, leaving the multiply in a type no hardware multiplier
+has -- for i16 that is `arith.muli : vector<16xi32>`, which reaches peano
+unclaimed.
 
 `Vec` is IRON's own rather than `SIMD.Vec`, whose element type must come from a
 fixed list that `BFloat16` is not on -- and bf16 is not incidental here but the

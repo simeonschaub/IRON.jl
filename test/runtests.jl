@@ -55,33 +55,25 @@ end
 
 # One output row per vector: broadcast an element of `a`, read the matching row of
 # `b`, multiply-accumulate. The shape aie::mmul has.
-function matmul_vec!(
-        a::Tile{T, Tuple{M, K}}, b::Tile{T, Tuple{K, N}}, c::Tile{T, Tuple{M, N}}
-    ) where {T, M, K, N}
-    for i in 1:M
-        acc = zero(Vec{N, T})
-        for k in 1:K
-            acc = muladd(Vec{N, T}(a[i, k]), vload(Vec{N, T}, b, k, 1), acc)
-        end
-        vstore!(acc, c, i, 1)
-    end
-    return nothing
-end
+#
+# The operands are widened as vectors, never as scalars: both MAC patterns require
+# "widening ops in the lhs and rhs operands", so a scalar widened before the
+# broadcast leaves the multiply in the accumulator's type, which no hardware
+# multiplier has. `Vec{N,T}(::Vec{N,T})` emits nothing, so one kernel covers the
+# same-type case too.
+mac_via(::Type{T}, ::Type{Tacc}) where {T, Tacc} = Tacc
+mac_via(::Type{Float8_E4M3FN}, ::Type{Float32}) = BFloat16
 
-# bf16 operands widened per vector into an f32 accumulator. This is the only shape
-# an f32 vector.fma lowers in: convert-vector-to-aievec requires both its operands
-# to come from an arith.extf on bf16, because the MAC multiplies bf16 and there is
-# no f32 multiplier on the core.
-function matmul_bf16_vec!(
-        a::Tile{BFloat16, Tuple{M, K}}, b::Tile{BFloat16, Tuple{K, N}},
-        c::Tile{Float32, Tuple{M, N}},
-    ) where {M, K, N}
+function matmul_vec!(
+        a::Tile{T, Tuple{M, K}}, b::Tile{T, Tuple{K, N}}, c::Tile{Tacc, Tuple{M, N}}
+    ) where {T, Tacc, M, K, N}
+    Mid = mac_via(T, Tacc)
     for i in 1:M
-        acc = zero(Vec{N, Float32})
+        acc = zero(Vec{N, Tacc})
         for k in 1:K
-            av = Vec{N, BFloat16}(a[i, k])
-            bv = vload(Vec{N, BFloat16}, b, k, 1)
-            acc = muladd(Vec{N, Float32}(av), Vec{N, Float32}(bv), acc)
+            av = Vec{N, T}(a[i, k])
+            bv = vload(Vec{N, T}, b, k, 1)
+            acc = muladd(Vec{N, Tacc}(Vec{N, Mid}(av)), Vec{N, Tacc}(Vec{N, Mid}(bv)), acc)
         end
         vstore!(acc, c, i, 1)
     end
@@ -362,7 +354,7 @@ end
         # bf16 or aiecc refuses to legalize the vector.fma.
         A = Tile{BFloat16, Tuple{16, 16}}
         C = Tile{Float32, Tuple{16, 16}}
-        bf = lower(matmul_bf16_vec!, Tuple{A, A, C})
+        bf = lower(matmul_vec!, Tuple{A, A, C})
         @test occursin(r"vector\.load .*memref<16x16xbf16>, vector<16xbf16>", bf)
         @test count("arith.extf", bf) == 2
         @test occursin("arith.extf %16 : vector<16xbf16> to vector<16xf32>", bf) ||
@@ -376,6 +368,24 @@ end
         @test !occursin("vector.fma", int_ir)
         @test occursin(r"arith\.muli .*: vector<16xi32>", int_ir)
         @test occursin(r"arith\.addi .*: vector<16xi32>", int_ir)
+
+        # i16 -> i32 widens as vectors. Widening the scalar before the broadcast
+        # would leave an i32 multiply, which no pattern matches and peano rejects
+        # with "unable to legalize <16 x s32> G_MUL".
+        I16 = Tile{Int16, Tuple{16, 16}}
+        I32 = Tile{Int32, Tuple{16, 16}}
+        mixed = lower(matmul_vec!, Tuple{I16, I16, I32})
+        @test occursin(r"vector\.broadcast .*: i16 to vector<16xi16>", mixed)
+        @test count("arith.extsi", mixed) == 2
+        @test occursin(r"arith\.extsi .*: vector<16xi16> to vector<16xi32>", mixed)
+        @test !occursin(r"arith\.extsi %\w+ : i16 to i32", mixed)
+
+        # FP8 goes through bf16, since the f32 fma wants operands extended from it.
+        F = Tile{Float8_E4M3FN, Tuple{16, 16}}
+        fp8 = lower(matmul_vec!, Tuple{F, F, C})
+        @test occursin(r"arith\.extf .*: vector<16xf8E4M3FN> to vector<16xbf16>", fp8)
+        @test occursin(r"arith\.extf .*: vector<16xbf16> to vector<16xf32>", fp8)
+        @test occursin(r"vector\.fma .*: vector<16xf32>", fp8)
     end
 
     @testset "vector kernels compute the right answer" begin
@@ -400,8 +410,13 @@ end
         u = BFloat16[(i + j) % 7 for i in 1:16, j in 1:16]
         v = BFloat16[(i - 2j) % 5 for i in 1:16, j in 1:16]
         w = zeros(Float32, 16, 16)
-        run_kernel(matmul_bf16_vec!, Tuple{A, A, C}, u, v, w)
+        run_kernel(matmul_vec!, Tuple{A, A, C}, u, v, w)
         @test w == Float32.(u) * Float32.(v)
+
+        # The FP8 vector kernel is checked as MLIR above but cannot be run here:
+        # lowering `vector<16xf8E4M3FN>` to LLVM asks x86's DataLayout for the
+        # alignment of an FP8 vector, which it has no answer for, and MLIR 18
+        # crashes rather than reporting it. The scalar FP8 kernels below do run.
     end
 
     @testset "generated module round-trips" begin

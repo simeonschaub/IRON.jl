@@ -206,7 +206,15 @@ function emit_vector!(kc::KernelContext, block::IR.Block, jblock, inst, fn, ops,
         from = eltype(IRStructurizer.value_type(jblock, ops[2]))
         to = eltype(inst[:type])
         from === to && return (kc.values[ssa] = source; nothing)
-        builder = bitwidth(to) > bitwidth(from) ? arith.extf : arith.truncf
+        if to <: Signed && from <: Signed
+            builder = bitwidth(to) > bitwidth(from) ? arith.extsi : arith.truncsi
+        elseif to <: Unsigned && from <: Unsigned
+            builder = bitwidth(to) > bitwidth(from) ? arith.extui : arith.truncui
+        elseif to <: AbstractFloat && from <: AbstractFloat
+            builder = bitwidth(to) > bitwidth(from) ? arith.extf : arith.truncf
+        else
+            error("Unsupported vector conversion from $from to $to")
+        end
         op = builder(source; out = result(), location = loc(ctx))
         push!(block, op)
         kc.values[ssa] = IR.result(op, 1)

@@ -34,51 +34,63 @@
 
 using IRON
 using BFloat16s: BFloat16
+using DLFP8Types: Float8_E4M3FN, Float8_E5M2
 
 const M, K, N = 16, 16, 16   # one vector wide
 
 """
-    matmul_bf16_vec!(a, b, c)
+    mac_via(T, Tacc) -> Type
 
-`c = a * b` with bf16 operands and an f32 accumulator, a row of `c` at a time.
+The type an operand of type `T` is widened through on its way to accumulator
+`Tacc`.
 
-Each step broadcasts one element of `a` across the lanes, reads the matching row
-of `b` as a vector, widens both, and multiply-accumulates: `N` outputs advance at
-once, and the accumulator stays in a vector register for the whole `k` loop rather
-than going near memory. This is the shape `aie::mmul` has, written in Julia.
+The f32 `vector.fma` pattern does not ask merely for widened operands, but for
+operands widened *from bf16* -- that being the only thing the MAC multiplies. So
+FP8 widens twice, `f8 -> bf16 -> f32`. Everything else goes straight to the
+accumulator, and the extra step costs nothing, because `Vec{N,T}(::Vec{N,T})`
+emits no op at all.
 """
-function matmul_bf16_vec!(
-        a::Tile{BFloat16, Tuple{M, K}}, b::Tile{BFloat16, Tuple{K, N}},
-        c::Tile{Float32, Tuple{M, N}},
-    ) where {M, K, N}
-    for i in 1:M
-        acc = zero(Vec{N, Float32})
-        for k in 1:K
-            av = Vec{N, BFloat16}(a[i, k])          # vector.broadcast
-            bv = vload(Vec{N, BFloat16}, b, k, 1)   # vector.load
-            # Vec{N,Float32}(::Vec{N,BFloat16}) is one arith.extf per vector, and
-            # what makes the vector.fma below legal.
-            acc = muladd(Vec{N, Float32}(av), Vec{N, Float32}(bv), acc)
-        end
-        vstore!(acc, c, i, 1)
-    end
-    return nothing
-end
+mac_via(::Type{T}, ::Type{Tacc}) where {T, Tacc} = Tacc
+mac_via(::Type{Float8_E4M3FN}, ::Type{Float32}) = BFloat16
+mac_via(::Type{Float8_E5M2}, ::Type{Float32}) = BFloat16
 
 """
     matmul_vec!(a, b, c)
 
-`c = a * b` over one element type, for the integer case, which needs no widening:
-`vector.fma` is floating-point only, so an integer multiply-accumulate lowers to
-`arith.muli` + `arith.addi` over vectors, which have patterns of their own.
+`c = a * b` with operands of type `T` and an accumulator of type `Tacc`, a row of
+`c` at a time. One kernel for i16 -> i32, bf16 -> f32 and FP8 -> f32.
+
+Widen the vectors, never the scalar. Both MAC patterns -- `vector.fma` for floats
+and `arith.muli`+`arith.addi` for integers -- ask the same thing of their operands:
+
+    "widening ops in the `lhs` and `rhs` operands, or fail otherwise"
+
+so each must be an `arith.extf`/`extsi` over a vector. Broadcasting `a[i, k]`
+straight into `Tacc` widens the scalar and then splats it, which leaves the
+multiply in the accumulator's type, matching nothing:
+
+    %17 = arith.extsi %16 : i16 to i32              # scalar
+    %18 = vector.broadcast %17 : i32 to vector<16xi32>
+    %20 = arith.muli %18, %19 : vector<16xi32>      # no i32 multiplier exists
+
+and peano stops with `unable to legalize <16 x s32> G_MUL` -- the integer echo of
+the f32 story. Broadcasting in `T` first and widening the vector afterwards puts
+the multiply back where the hardware has one.
 """
 function matmul_vec!(
-        a::Tile{T, Tuple{M, K}}, b::Tile{T, Tuple{K, N}}, c::Tile{T, Tuple{M, N}}
-    ) where {T, M, K, N}
+        a::Tile{T, Tuple{M, K}}, b::Tile{T, Tuple{K, N}}, c::Tile{Tacc, Tuple{M, N}}
+    ) where {T, Tacc, M, K, N}
+    Mid = mac_via(T, Tacc)
     for i in 1:M
-        acc = zero(Vec{N, T})
+        acc = zero(Vec{N, Tacc})
         for k in 1:K
-            acc = muladd(Vec{N, T}(a[i, k]), vload(Vec{N, T}, b, k, 1), acc)
+            av = Vec{N, T}(a[i, k])                 # vector.broadcast, in T
+            bv = vload(Vec{N, T}, b, k, 1)          # vector.load, in T
+            acc = muladd(                           # widen the vectors, then MAC
+                Vec{N, Tacc}(Vec{N, Mid}(av)),
+                Vec{N, Tacc}(Vec{N, Mid}(bv)),
+                acc,
+            )
         end
         vstore!(acc, c, i, 1)
     end
@@ -104,36 +116,58 @@ end
 # programming_examples/ passes this flag.
 const AIECC_FLAGS = ["--alloc-scheme=basic-sequential"]
 
-if get(ENV, "IRON_RUN", "0") == "1"
-    program = matmul_program(matmul_bf16_vec!, BFloat16, Float32)
-    compiled = IRON.compile(program; aiecc_flags = AIECC_FLAGS)
+# Every value here is a small integer, exact in bf16 and in FP8's 4-bit mantissa,
+# so each product can be compared for equality rather than tolerance.
+operand(::Type{T}, f) where {T} = T[T(f(i, j)) for i in 1:M, j in 1:K]
 
-    # Small integers, exact in bf16, so the product can be compared for equality.
-    a = BFloat16[(i + j) % 7 for i in 1:M, j in 1:K]
-    b = BFloat16[(i - 2j) % 5 for i in 1:K, j in 1:N]
-    da, db = IRON.device_array(a), IRON.device_array(b)
-    dc = IRON.device_zeros(Tile{Float32, Tuple{M, N}})
-    IRON.run!(compiled, da, db, dc)
+function run_case(::Type{Tin}, ::Type{Tacc}) where {Tin, Tacc}
+    label = rpad("$Tin -> $Tacc", 26)
+    a = operand(Tin, (i, j) -> (i + j) % 7)
+    b = operand(Tin, (i, j) -> (i - 2j) % 5)
+
+    compiled = IRON.compile(
+        matmul_program(matmul_vec!, Tin, Tacc); aiecc_flags = AIECC_FLAGS
+    )
+    dc = IRON.device_zeros(Tile{Tacc, Tuple{M, N}})
+    IRON.run!(compiled, IRON.device_array(a), IRON.device_array(b), dc)
 
     result = IRON.host_array(dc)
-    expected = Float32.(a) * Float32.(b)
+    expected = Tacc.(Float32.(a) * Float32.(b))
     if result == expected
-        println("NPU vectorized bf16 matmul matches")
+        println(label, "PASS")
     else
-        println("MISMATCH in $(count(result .!= expected)) of $(length(expected))")
-        println("got:\n", result)
-        println("expected:\n", expected)
+        println(label, "MISMATCH in $(count(result .!= expected)) of $(length(expected))")
+        println("  got:      ", vec(result)[1:min(8, end)], " ...")
+        println("  expected: ", vec(expected)[1:min(8, end)], " ...")
     end
+    return nothing
+end
+
+if get(ENV, "IRON_RUN", "0") == "1"
+    # Measured on an NPU2. Only bf16 -> f32 makes it all the way, which is the
+    # combination the MAC is built out of; the other two are here because where
+    # they stop is informative, and they throw rather than being caught, since the
+    # backtrace is the useful part.
+    #
+    #   BFloat16 -> Float32       PASS
+    #   Int16 -> Int32            peano: "unable to legalize <16 x s32> G_MUL".
+    #                             The MAC widens i16 to i32 internally; there is no
+    #                             i32 vector multiply for the aievec op to sit on,
+    #                             and arith.muli reaches peano unclaimed.
+    #   Float8_E4M3FN -> Float32  aiecc fails somewhere past the aievec conversion.
+    #
+    run_case(BFloat16, Float32)
+    run_case(Int16, Int32)
+    run_case(Float8_E4M3FN, Float32)
 else
-    println("bf16 operands, f32 accumulator -- what convert-vector-to-aievec wants:\n")
-    for l in split(generate_mlir(matmul_program(matmul_bf16_vec!, BFloat16, Float32)), '\n')
-        occursin(r"vector\.(load|store|broadcast|fma)|arith\.extf", l) &&
-            println("  ", strip(replace(l, r"^\s*%\w+ = " => "")))
+    show_ops(mlir) = for l in split(mlir, '\n')
+        occursin(r"vector\.(load|store|broadcast|fma)|arith\.(extf|extsi|muli|addi) .*vector", l) &&
+            println("    ", strip(replace(l, r"^\s*%\w+ = " => "")))
     end
 
-    println("\nintegers need no widening:\n")
-    for l in split(generate_mlir(matmul_program(matmul_vec!, Int32, Int32)), '\n')
-        occursin(r"vector\.(load|store|broadcast)|arith\.(muli|addi) .*vector", l) &&
-            println("  ", strip(replace(l, r"^\s*%\w+ = " => "")))
+    for (Tin, Tacc) in ((Int16, Int32), (BFloat16, Float32), (Float8_E4M3FN, Float32))
+        println("  $Tin -> $Tacc:")
+        show_ops(generate_mlir(matmul_program(matmul_vec!, Tin, Tacc)))
+        println()
     end
 end
