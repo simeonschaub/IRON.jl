@@ -41,13 +41,15 @@ using PythonCall
 
 const CC = Core.Compiler
 
-include("context.jl")
-include("interpreter.jl")
-include("tile.jl")
-include("vec.jl")
-include("dialects.jl")
-include("kernel.jl")
-include("design.jl")
+include("device/tile.jl")
+include("device/vec.jl")
+
+include("compiler/mlir/utils.jl")
+include("compiler/mlir/dialects.jl")
+include("compiler/mlir/dataflow.jl")
+include("compiler/interpreter.jl")
+include("compiler/compiler.jl")
+
 include("runtime.jl")
 
 export Tile, Vec
