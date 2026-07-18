@@ -46,6 +46,7 @@ using GPUArraysCore: GPUArraysCore, AbstractGPUArray, @allowscalar
 using Peano_jll: Peano_jll
 using mlir_aie_jll: aiecc
 using ironxrt_jll: libironxrt
+using xrt_jll: xrt_jll
 
 const CC = Core.Compiler
 
