@@ -17,6 +17,10 @@
 # `python/utils/compile/utils.py:compile_mlir_module`, so a design gets the same
 # lowering it would through the Python stack.
 
+# The name `aiecc` gives the xclbin's kernel by default (we do not pass
+# `--xclbin-kernel-name`); the runtime opens the kernel under the same name.
+const KERNEL_NAME = "MLIR_AIE"
+
 """
     aiecc_compile(mlir_file; workdir, xclbin, insts, flags=String[], verbose=false)
         -> (xclbin, insts)

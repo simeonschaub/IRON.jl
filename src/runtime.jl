@@ -20,8 +20,6 @@ function _xrt_device_open(index::Integer)
     return d
 end
 
-_xrt_device_close(d::Ptr{Cvoid}) = @ccall libironxrt.ironxrt_device_close(d::Ptr{Cvoid})::Cvoid
-
 function _xrt_open(dev::Ptr{Cvoid}, xclbin::AbstractString, kernel::AbstractString)
     ctx = @ccall libironxrt.ironxrt_open(
         dev::Ptr{Cvoid}, xclbin::Cstring, kernel::Cstring
@@ -72,14 +70,6 @@ function _xrt_run(ctx::Ptr{Cvoid}, instr::Ptr{Cvoid}, ninstr::Integer, args::Vec
         pointer(args)::Ptr{Ptr{Cvoid}}, length(args)::Cuint
     )::Cint
     r == 0 || error("IRON: NPU launch failed: $(_xrt_error())")
-    return nothing
-end
-
-# Copy `nbytes` raw bytes between a host array and a mapped-buffer pointer. The
-# NPU takes the element bytes verbatim -- bf16 and the FP8 formats included -- so
-# there is no dtype translation, unlike the old numpy path.
-function _copy_bytes(dst::Ptr, src::Ptr, nbytes::Integer)
-    unsafe_copyto!(Ptr{UInt8}(dst), Ptr{UInt8}(src), nbytes)
     return nothing
 end
 
@@ -182,7 +172,7 @@ end
 # that will release it (and the instruction buffer).
 function _context!(c::CompiledProgram)
     if c.ctx == C_NULL
-        c.ctx = _xrt_open(_device!(), c.xclbin, "MLIR_AIE")
+        c.ctx = _xrt_open(_device!(), c.xclbin, KERNEL_NAME)
         finalizer(_release!, c)
     end
     return c.ctx
@@ -194,7 +184,8 @@ function _instr_bo!(c::CompiledProgram, ctx::Ptr{Cvoid})
     if c.instr_bo == C_NULL
         gid = _xrt_group_id(ctx, 1)
         bo = _xrt_bo_alloc(_device!(), sizeof(c.insts), gid, true)
-        GC.@preserve c _copy_bytes(_xrt_bo_map(bo), pointer(c.insts), sizeof(c.insts))
+        n = sizeof(c.insts)
+        GC.@preserve c unsafe_copyto!(Ptr{UInt8}(_xrt_bo_map(bo)), Ptr{UInt8}(pointer(c.insts)), n)
         _xrt_bo_sync_to_device(bo)
         c.instr_bo = bo
     end
@@ -221,7 +212,7 @@ function run!(c::CompiledProgram, arrays::NPUArray...)
     # The design's resident buffers, in argument order. Flush each to the device
     # (inputs may have been written since the last sync), launch, then pull each
     # back so a host read sees the design's output.
-    bos = Ptr{Cvoid}[a.bo for a in arrays]
+    bos = Ptr{Cvoid}[buffer(a) for a in arrays]
     for bo in bos
         _xrt_bo_sync_to_device(bo)
     end
