@@ -1,7 +1,7 @@
 name = "IRON"
 uuid = "d4957cf2-1973-4b5b-8ba8-222f49ed34ed"
-authors = ["Simeon David Schaub <simeon@schaub.rocks> and contributors"]
 version = "1.0.0-DEV"
+authors = ["Simeon David Schaub <simeon@schaub.rocks> and contributors"]
 
 [deps]
 Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
@@ -11,27 +11,23 @@ MLIR = "bfde9dd4-8f40-4a1e-be09-1475335e1c92"
 Peano_jll = "7666bd74-b3e7-5b20-876b-cf50444d5367"
 ironxrt_jll = "a846d562-341d-4e7d-a31c-6839ace40484"
 mlir_aie_jll = "2db12af9-d9f4-5b21-b666-63f8a71d6323"
+xrt_jll = "bb401bc5-fb22-5674-bf0e-333823e8805f"
 
 [weakdeps]
 DLFP8Types = "f4c16678-4a16-415b-82ef-ed337c5d6c7c"
 Microfloats = "31c70f10-a750-4521-b13c-797315ae2933"
 
+[sources]
+IRStructurizer = {rev = "fix-returnnode-operands", url = "https://github.com/simeonschaub/IRStructurizer.jl"}
+MLIR = {rev = "fix-mark-donate-and-text-printing", url = "https://github.com/simeonschaub/MLIR.jl"}
+Peano_jll = {path = "/home/simeon/.julia/dev/Peano_jll"}
+ironxrt_jll = {path = "/home/simeon/.julia/dev/ironxrt_jll"}
+mlir_aie_jll = {path = "/home/simeon/.julia/dev/mlir_aie_jll"}
+xrt_jll = {path = "/home/simeon/.julia/dev/xrt_jll"}
+
 [extensions]
 IRONDLFP8TypesExt = "DLFP8Types"
 IRONMicrofloatsExt = "Microfloats"
-
-[sources]
-IRStructurizer = {url = "https://github.com/simeonschaub/IRStructurizer.jl", rev = "fix-returnnode-operands"}
-MLIR = {url = "https://github.com/simeonschaub/MLIR.jl", rev = "fix-mark-donate-and-text-printing"}
-# Custom JLLs wrapping the MLIR-AIE / Peano / XRT toolchain (not registered).
-# Developed as siblings of this repo; adjust the paths if your layout differs.
-# `ironxrt_jll` (the XRT C shim) is built from Yggdrasil/I/ironxrt -- deploy it
-# next to the others, or point this path wherever your build lands it. `xrt_jll`
-# is a transitive dependency of `ironxrt_jll`; its path is given here too so the
-# environment can resolve it.
-Peano_jll = {path = "/home/simeon/.julia/dev/Peano_jll"}
-mlir_aie_jll = {path = "/home/simeon/.julia/dev/mlir_aie_jll"}
-ironxrt_jll = {path = "/home/simeon/.julia/dev/ironxrt_jll"}
 
 [compat]
 Adapt = "4"
@@ -42,5 +38,8 @@ MLIR = "0.2"
 Microfloats = "0.2"
 Peano_jll = "21"
 ironxrt_jll = "0.1"
-mlir_aie_jll = "1.3"
 julia = "1.11"
+mlir_aie_jll = "1.3"
+
+[extras]
+xrt_jll = "bb401bc5-fb22-5674-bf0e-333823e8805f"
