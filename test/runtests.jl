@@ -82,6 +82,32 @@ function matmul_vec!(
     return nothing
 end
 
+# The tiled-GEMM micro-kernels (see src/gemm.jl and examples/gemm.jl): `gemm_zero!`
+# clears an output tile and `gemm_acc!` accumulates `c += a * b` into it, so driving
+# the pair tile by tile reduces a full C = A * B.
+function gemm_zero!(c::Tile{Tacc, Tuple{m, n}}) where {Tacc, m, n}
+    z = zero(Vec{m, Tacc})
+    for j in 1:n
+        vstore!(z, c, 1, j)
+    end
+    return nothing
+end
+
+function gemm_acc!(
+        a::Tile{T, Tuple{m, k}}, b::Tile{T, Tuple{k, n}}, c::Tile{Tacc, Tuple{m, n}},
+    ) where {T, Tacc, m, k, n}
+    for j in 1:n
+        acc = vload(Vec{m, Tacc}, c, 1, j)
+        for kk in 1:k
+            av = vload(Vec{m, T}, a, 1, kk)
+            bv = Vec{m, T}(b[kk, j])
+            acc = muladd(Vec{m, Tacc}(av), Vec{m, Tacc}(bv), acc)
+        end
+        vstore!(acc, c, 1, j)
+    end
+    return nothing
+end
+
 # Too few subscripts for the tile's rank.
 function bad_rank(a::Tile{Float32, Tuple{4, 4}}, b::Tile{Float32, Tuple{4, 4}})
     for i in 1:4
@@ -452,6 +478,74 @@ end
         # lowering `vector<16xf8E4M3FN>` to LLVM asks x86's DataLayout for the
         # alignment of an FP8 vector, which it has no answer for, and MLIR 18
         # crashes rather than reporting it. The scalar FP8 kernels below do run.
+    end
+
+    @testset "tiled gemm" begin
+        # Micro-kernel tile: m is the f32 vector width.
+        m, k, n = 16, 32, 16
+        A_t = Tile{BFloat16, Tuple{m, k}}
+        B_t = Tile{BFloat16, Tuple{k, n}}
+        C_t = Tile{Float32, Tuple{m, n}}
+
+        # gemm_zero! clears a tile.
+        c = rand(Float32, m, n)
+        run_kernel(gemm_zero!, Tuple{C_t}, c)
+        @test all(iszero, c)
+
+        # gemm_acc! accumulates into c, reading the running value back: a second call
+        # doubles the product, which a kernel that overwrote c could not do.
+        a = BFloat16[(i + j) % 7 for i in 1:m, j in 1:k]
+        b = BFloat16[(i - 2j) % 5 for i in 1:k, j in 1:n]
+        c = zeros(Float32, m, n)
+        run_kernel(gemm_acc!, Tuple{A_t, B_t, C_t}, a, b, c)
+        @test c == Float32.(a) * Float32.(b)
+        run_kernel(gemm_acc!, Tuple{A_t, B_t, C_t}, a, b, c)
+        @test c == 2 .* (Float32.(a) * Float32.(b))
+
+        # Driving the pair over every tile reduces a full C = A * B. This is the
+        # compute the on-NPU design does; the host DMA that feeds the tiles there is
+        # exercised by the MLIR checks below rather than run.
+        M, K, N = 32, 64, 32
+        Mt, Kt, Nt = M ÷ m, K ÷ k, N ÷ n
+        Abig = BFloat16[(i + j) % 7 for i in 1:M, j in 1:K]
+        Bbig = BFloat16[(i - 2j) % 5 for i in 1:K, j in 1:N]
+        Cbig = zeros(Float32, M, N)
+        tile(A, tr, tc, ti, tj) = A[(ti * tr + 1):(ti * tr + tr), (tj * tc + 1):(tj * tc + tc)]
+        for mi in 0:(Mt - 1), nj in 0:(Nt - 1)
+            ctile = zeros(Float32, m, n)
+            run_kernel(gemm_zero!, Tuple{C_t}, ctile)
+            for kk in 0:(Kt - 1)
+                run_kernel(
+                    gemm_acc!, Tuple{A_t, B_t, C_t},
+                    tile(Abig, m, k, mi, kk), tile(Bbig, k, n, kk, nj), ctile,
+                )
+            end
+            Cbig[(mi * m + 1):(mi * m + m), (nj * n + 1):(nj * n + n)] = ctile
+        end
+        @test Cbig == Float32.(Abig) * Float32.(Bbig)
+
+        # tile_access reports the column-major access pattern of a tile: the offset is
+        # the linear index of its top-left element, the pattern walks it column by
+        # column, and the length is its element count. Tile (1, 0) of an (m, k) tiling
+        # of an M x K buffer starts one tile-row down: element (m, 0), offset m.
+        off, dims, len = IRON.tile_access(M, K, m, k, 1, 0)
+        @test off == 1 * m + 0 * k * M
+        @test len == m * k
+        @test dims == [(1, 0), (1, 0), (k, K), (m, 1)]
+
+        # gemm_program emits a valid, round-tripping module: one core, three FIFOs,
+        # the core acquiring outC as a producer and inA/inB as consumers, the MAC in
+        # the reduction body, and one awaited C drain per output tile.
+        gemm_mlir = gemm_program(gemm_zero!, gemm_acc!, BFloat16, Float32, M, K, N, m, k, n)
+        mod = parse(IR.Module, gemm_mlir; context = context())
+        @test IR.verify(IR.Operation(mod))
+        @test occursin("sym_name = \"inA\"", gemm_mlir)
+        @test occursin("sym_name = \"inB\"", gemm_mlir)
+        @test occursin("sym_name = \"outC\"", gemm_mlir)
+        @test occursin("objFifo_name = @outC, port = 0 : i32", gemm_mlir)  # core produces C
+        @test occursin("objFifo_name = @inA, port = 1 : i32", gemm_mlir)   # core consumes A
+        @test occursin("vector.fma", gemm_mlir)
+        @test count("aiex.dma_await_task", gemm_mlir) == Mt * Nt  # one drain per output tile
     end
 
     @testset "generated module round-trips" begin
