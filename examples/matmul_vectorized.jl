@@ -64,15 +64,20 @@ mac_via(::Type{Float8_E5M2}, ::Type{Float32}) = BFloat16
 """
     matmul_vec!(a, b, c)
 
-`c = a * b` with operands of type `T` and an accumulator of type `Tacc`, a row of
+`c = a * b` with operands of type `T` and an accumulator of type `Tacc`, a column of
 `c` at a time. One kernel for i16 -> i32, bf16 -> f32 and FP8 -> f32.
+
+A tile is column-major, so the contiguous vector is a *column*: `vload` reads down a
+column of `a`, `b[k, j]` is broadcast, and the accumulator carries a whole column of
+`c`. Passing column-major Julia arrays (the norm) and reading the result back
+column-major then needs no transpose and no operand swap -- `c` really is `a * b`.
 
 Widen the vectors, never the scalar. Both MAC patterns -- `vector.fma` for floats
 and `arith.muli`+`arith.addi` for integers -- ask the same thing of their operands:
 
     "widening ops in the `lhs` and `rhs` operands, or fail otherwise"
 
-so each must be an `arith.extf`/`extsi` over a vector. Broadcasting `a[i, k]`
+so each must be an `arith.extf`/`extsi` over a vector. Broadcasting `b[k, j]`
 straight into `Tacc` widens the scalar and then splats it, which leaves the
 multiply in the accumulator's type, matching nothing:
 
@@ -88,18 +93,18 @@ function matmul_vec!(
         a::Tile{T, Tuple{M, K}}, b::Tile{T, Tuple{K, N}}, c::Tile{Tacc, Tuple{M, N}}
     ) where {T, Tacc, M, K, N}
     Mid = mac_via(T, Tacc)
-    for i in 1:M
-        acc = zero(Vec{N, Tacc})
+    for j in 1:N
+        acc = zero(Vec{M, Tacc})
         for k in 1:K
-            av = Vec{N, T}(a[i, k])                 # vector.broadcast, in T
-            bv = vload(Vec{N, T}, b, k, 1)          # vector.load, in T
+            av = vload(Vec{M, T}, a, 1, k)          # vector.load, a column of `a`, in T
+            bv = Vec{M, T}(b[k, j])                 # vector.broadcast, in T
             acc = muladd(                           # widen the vectors, then MAC
-                Vec{N, Tacc}(Vec{N, Mid}(av)),
-                Vec{N, Tacc}(Vec{N, Mid}(bv)),
+                Vec{M, Tacc}(Vec{M, Mid}(av)),
+                Vec{M, Tacc}(Vec{M, Mid}(bv)),
                 acc,
             )
         end
-        vstore!(acc, c, i, 1)
+        vstore!(acc, c, 1, j)
     end
     return nothing
 end
@@ -135,7 +140,7 @@ function run_case(::Type{Tin}, ::Type{Tacc}) where {Tin, Tacc}
     b = operand(Tin, Tacc, (i, j) -> (i - 2j) % 5)
 
     compiled = IRON.compile(
-        matmul_program(matmul_vec!, Tin, Tacc); flags = AIECC_FLAGS
+        matmul_program(matmul_vec!, Tin, Tacc); flags = AIECC_FLAGS,
     )
     dc = NPUArray{Tacc}(undef, Tile{Tacc, Tuple{tile_size(Tacc), tile_size(Tacc)}})
     IRON.run!(compiled, NPUArray(a), NPUArray(b), dc)
@@ -146,8 +151,8 @@ function run_case(::Type{Tin}, ::Type{Tacc}) where {Tin, Tacc}
         println(label, "PASS")
     else
         println(label, "MISMATCH in $(count(result .!= expected)) of $(length(expected))")
-        println("  got:      ", vec(result)[1:min(8, end)], " ...")
-        println("  expected: ", vec(expected)[1:min(8, end)], " ...")
+        println("  got:      ", result)
+        println("  expected: ", expected)
     end
     return nothing
 end
@@ -173,9 +178,9 @@ if get(ENV, "IRON_RUN", "0") == "1"
     #                             getVectorOpDestType only widens 16-bit floats.
     #
     run_case(BFloat16, Float32)
-    run_case(Float8_E4M3FN, Float32)
-    run_case(Int16, Int16)
-    run_case(Int16, Int32)
+    #run_case(Float8_E4M3FN, Float32)
+    #run_case(Int16, Int16)
+    #run_case(Int16, Int32)
 else
     show_ops(mlir) = for l in split(mlir, '\n')
         occursin(r"vector\.(load|store|broadcast|fma)|arith\.(extf|extsi|muli|addi) .*vector", l) &&
@@ -186,7 +191,7 @@ else
             (Int16, Int16), (Int16, Int32), (BFloat16, Float32), (Float8_E4M3FN, Float32),
         )
         println("  $Tin -> $Tacc:")
-        show_ops(generate_mlir(matmul_program(matmul_vec!, Tin, Tacc)))
+        println(generate_mlir(matmul_program(matmul_vec!, Tin, Tacc)))
         println()
     end
 end

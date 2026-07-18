@@ -53,8 +53,10 @@ function matmul_fp8!(
     return nothing
 end
 
-# One output row per vector: broadcast an element of `a`, read the matching row of
-# `b`, multiply-accumulate. The shape aie::mmul has.
+# One output column per vector: read the matching column of `a`, broadcast an
+# element of `b`, multiply-accumulate. This is the column-major mirror of the shape
+# aie::mmul has -- a tile is column-major, so the contiguous `vector.load` runs down
+# a column of `a`, and the accumulator carries a whole column of `c`.
 #
 # The operands are widened as vectors, never as scalars: both MAC patterns require
 # "widening ops in the lhs and rhs operands", so a scalar widened before the
@@ -68,14 +70,14 @@ function matmul_vec!(
         a::Tile{T, Tuple{M, K}}, b::Tile{T, Tuple{K, N}}, c::Tile{Tacc, Tuple{M, N}}
     ) where {T, Tacc, M, K, N}
     Mid = mac_via(T, Tacc)
-    for i in 1:M
-        acc = zero(Vec{N, Tacc})
+    for j in 1:N
+        acc = zero(Vec{M, Tacc})
         for k in 1:K
-            av = Vec{N, T}(a[i, k])
-            bv = vload(Vec{N, T}, b, k, 1)
-            acc = muladd(Vec{N, Tacc}(Vec{N, Mid}(av)), Vec{N, Tacc}(Vec{N, Mid}(bv)), acc)
+            av = vload(Vec{M, T}, a, 1, k)
+            bv = Vec{M, T}(b[k, j])
+            acc = muladd(Vec{M, Tacc}(Vec{M, Mid}(av)), Vec{M, Tacc}(Vec{M, Mid}(bv)), acc)
         end
-        vstore!(acc, c, i, 1)
+        vstore!(acc, c, 1, j)
     end
     return nothing
 end
@@ -149,16 +151,18 @@ end
     @testset "tile types" begin
         ctx = context()
         @test string(memref_type(ctx, Buf)) == "memref<1024xi32>"
-        @test string(memref_type(ctx, Tile{Float32, Tuple{8, 16}})) == "memref<8x16xf32>"
+        # Column-major tile -> row-major memref of the reversed shape.
+        @test string(memref_type(ctx, Tile{Float32, Tuple{8, 16}})) == "memref<16x8xf32>"
         @test string(objectfifo_type(ctx, Buf)) == "!aie.objectfifo<memref<1024xi32>>"
         @test size(Buf) == (1024,)
         @test eltype(Buf) === Int32
     end
 
     @testset "NPUArray host array" begin
-        # Built directly from a placeholder buffer: this exercises the Julia-side
-        # array interface and the Adapt mapping without an NPU or the Python stack.
-        a = IRON.NPUArray{Int32, 2}(IRON.Py(nothing), (2, 3))
+        # Built over a plain host array with a null buffer handle: this exercises the
+        # Julia-side array interface and the Adapt mapping without an NPU, and without
+        # ever calling into XRT (a null handle makes the syncs no-ops).
+        a = IRON.NPUArray{Int32, 2}(C_NULL, zeros(Int32, 2, 3))
         @test a isa IRON.AbstractGPUArray{Int32, 2}
         @test eltype(a) === Int32
         @test size(a) == (2, 3)
@@ -176,9 +180,11 @@ end
         @test hasmethod(getindex, Tuple{typeof(a), Int, Int})
         @test hasmethod(setindex!, Tuple{typeof(a), Int32, Int, Int})
 
-        # Contents are never printed (that would copy the buffer back element by
-        # element); the summary names the type and shape instead.
-        @test occursin("NPUArray", sprint(show, a))
+        # Show renders through a single host copy (the GPUArrays convention), never
+        # scalar-indexing the buffer: the compact form matches the host array's, and
+        # the multi-line form prefixes it with a "2×3 NPUArray{...}" summary.
+        @test sprint(show, a) == sprint(show, Array(a))
+        @test occursin("NPUArray", sprint(show, MIME("text/plain"), a))
         @test occursin("2×3", sprint(show, MIME("text/plain"), a))
     end
 
@@ -279,12 +285,14 @@ end
                 Tile{Float32, Tuple{4, 8}}, Tile{Float32, Tuple{8, 2}}, Tile{Float32, Tuple{4, 2}},
             }
         )
-        # Two subscripts per access, and the non-square shapes stay distinct.
-        @test occursin(r"memref\.load %\w+\[%\w+, %\w+\] : memref<4x8xf32>", ir)
-        @test occursin(r"memref\.load %\w+\[%\w+, %\w+\] : memref<8x2xf32>", ir)
+        # Two subscripts per access, and the non-square shapes stay distinct. The
+        # memref shapes are the tile shapes reversed: a column-major tile lowers to
+        # the row-major memref of the reversed extents.
+        @test occursin(r"memref\.load %\w+\[%\w+, %\w+\] : memref<8x4xf32>", ir)
+        @test occursin(r"memref\.load %\w+\[%\w+, %\w+\] : memref<2x8xf32>", ir)
         # The stored value is `%N#0`: the accumulator comes out of the k loop, which
         # carries more than one result.
-        @test occursin(r"memref\.store %[\w#]+, %\w+\[%\w+, %\w+\] : memref<4x2xf32>", ir)
+        @test occursin(r"memref\.store %[\w#]+, %\w+\[%\w+, %\w+\] : memref<2x4xf32>", ir)
 
         @test_throws "takes 2 subscripts, got 1" lower(
             bad_rank, Tuple{Tile{Float32, Tuple{4, 4}}, Tile{Float32, Tuple{4, 4}}}

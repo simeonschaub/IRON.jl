@@ -106,7 +106,13 @@ Base.copyto!(dst::AbstractArray, src::NPUArray) = copyto!(dst, Array(src))
 
 # Displaying follows the GPUArrays convention: copy to the host once and let Base
 # render that, rather than scalar-indexing the device buffer element by element.
+# Base's array show reaches the elements through these four entry points; routing
+# each through a host `Array` replaces the per-element `getindex` -- which would trip
+# the scalar-indexing guard -- with one bulk copy, while still printing the contents.
 Base.print_array(io::IO, a::NPUArray) = Base.print_array(io, Array(a))
+Base._show_nonempty(io::IO, a::NPUArray, prefix::String) = Base._show_nonempty(io, Array(a), prefix)
+Base._show_empty(io::IO, a::NPUArray) = Base._show_empty(io, Array(a))
+Base.show_vector(io::IO, a::NPUArray, args...) = Base.show_vector(io, Array(a), args...)
 
 # --- Adapt: launch-argument conversion (NPUArray -> Tile) --------------------
 # The IRON analogue of `CUDACore.KernelAdaptor`/`cuTile.KernelAdaptor`: adapting a

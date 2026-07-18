@@ -138,12 +138,16 @@ end
 # One subscript per memref dimension, each lowered from 1-based to 0-based. The
 # arity check is here because MLIR's own diagnostic for it arrives much later, from
 # the module verifier, and does not mention the kernel.
+#
+# The order is reversed: a `Tile` is column-major and its memref is the reversed,
+# row-major shape (see `memref_type`), so a Julia subscript `[i, j]` addresses the
+# same element as the memref subscript `[j, i]`.
 function subscripts!(kc::KernelContext, block::IR.Block, tile::IR.Value, indices)
     rank = Int(API.mlirShapedTypeGetRank(IR.type(tile)))
     length(indices) == rank || error(
         "IRON: a $(rank)-dimensional tile takes $rank subscripts, got $(length(indices))"
     )
-    return IR.Value[memref_index!(kc, block, i) for i in indices]
+    return IR.Value[memref_index!(kc, block, i) for i in Iterators.reverse(indices)]
 end
 
 # `arith.extf` widens and `arith.truncf` narrows; MLIR has no single float cast, and

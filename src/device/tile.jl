@@ -5,8 +5,17 @@
     Tile{T,Dims}
 
 A tile of device memory, as seen from inside a kernel. `T` is the element type and
-`Dims` is a `Tuple` type of the extents, e.g. `Tile{Int32,Tuple{1024}}` lowers to
-`memref<1024xi32>` and `Tile{Float32,Tuple{8,16}}` to `memref<8x16xf32>`.
+`Dims` is a `Tuple` type of the extents in Julia's own order, e.g.
+`Tile{Int32,Tuple{1024}}` and `Tile{Float32,Tuple{8,16}}`.
+
+A tile is **column-major**, the convention Julia arrays follow: the first subscript
+varies fastest and a `Tile{T,Tuple{M,N}}` is stored one column at a time. An MLIR
+memref is row-major, so the same storage is a memref of the *reversed* shape --
+`Tile{Float32,Tuple{8,16}}` lowers to `memref<16x8xf32>`, and a subscript `[i, j]`
+lowers to the memref subscript `[j, i]`. That keeps the fastest-varying Julia
+dimension the contiguous one, which is what a `vector.load` reads along and what a
+host `NPUArray`'s column-major buffer already holds, so no transpose ever runs
+between host and device. See [`memref_type`](@ref) and `subscripts!`.
 
 A `Tile` has no host representation and is never constructed: it exists so that a
 kernel can be type-inferred against it, and its `getindex`/`setindex!` are markers
@@ -63,9 +72,17 @@ bitwidth(::Type{T}) where {T} = 8 * sizeof(T)
     memref_type(ctx, ::Type{Tile{T,Dims}}) -> IR.Type
 
 The `memref` type a `Tile` lowers to.
+
+A `Tile` is column-major but a memref is row-major, so the extents are reversed:
+`Tile{Float32,Tuple{8,16}}` becomes `memref<16x8xf32>`. This is the same
+column-major-to-row-major reversal cuTile makes at its Julia boundary, and it is
+paired with the subscript reversal in `subscripts!`. The reversed memref is a plain
+contiguous (identity-layout) one, so the fast Julia dimension stays unit-stride and
+`vector.load`/`vector.store` -- which walk the memref's minor dimension -- read and
+write down a column.
 """
 function memref_type(ctx::IR.Context, ::Type{Tile{T, Dims}}) where {T, Dims}
-    dims = Int[Dims.parameters...]
+    dims = reverse(Int[Dims.parameters...])
     element = mlir_eltype(ctx, T)
     return IR.Type(API.mlirMemRefTypeContiguousGet(element, length(dims), dims, IR.Attribute()))
 end

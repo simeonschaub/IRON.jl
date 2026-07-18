@@ -50,13 +50,19 @@ function _xrt_bo_map(bo::Ptr{Cvoid})
     return p
 end
 
+# A null buffer -- a placeholder or an already-freed one -- has nothing to sync, so
+# these are no-ops on `C_NULL` rather than a call into the shim, matching how
+# `_free_bo!` guards a null handle. That also lets an `NPUArray` built over a plain
+# host array (no device) be read and shown without touching XRT.
 function _xrt_bo_sync_to_device(bo::Ptr{Cvoid})
+    bo == C_NULL && return nothing
     r = @ccall libironxrt.ironxrt_bo_sync_to_device(bo::Ptr{Cvoid})::Cint
     r == 0 || error("IRON: sync to device failed: $(_xrt_error())")
     return nothing
 end
 
 function _xrt_bo_sync_from_device(bo::Ptr{Cvoid})
+    bo == C_NULL && return nothing
     r = @ccall libironxrt.ironxrt_bo_sync_from_device(bo::Ptr{Cvoid})::Cint
     r == 0 || error("IRON: sync from device failed: $(_xrt_error())")
     return nothing
