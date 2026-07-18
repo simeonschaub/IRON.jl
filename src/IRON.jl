@@ -60,6 +60,8 @@ include("compiler/aiecc.jl")
 
 include("array.jl")
 include("runtime.jl")
+include("launch.jl")
+include("schedule.jl")
 include("gemm.jl")
 
 export Tile, Vec
@@ -69,5 +71,6 @@ export ObjectFifo, Endpoint, producer, consumer
 export Worker, Runtime, start!, drain!, Program
 export generate_mlir, gemm_program
 export NPUArray, @allowscalar
+export @iron, @iron_schedule, In, Out
 
 end # module
