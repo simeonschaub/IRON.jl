@@ -62,8 +62,23 @@ function aiecc_compile(
     ]
     verbose && push!(args, "--verbose")
     append!(args, flags)
-    # `aiecc()` yields a Cmd carrying the JLL's library environment; the Peano
-    # tools it spawns are found through `--peano` above.
-    run(`$(aiecc()) $mlir_file $args`)
+    # `aiecc()` yields a Cmd carrying the JLL's library environment; the Peano tools
+    # it spawns are found through `--peano` above. `xclbinutil`, the last step that
+    # packages the xclbin, is instead located via PATH (or next to aiecc) -- and it
+    # ships in `xrt_jll`, a different artifact, so put that bin on PATH. Without it
+    # aiecc skips xclbin generation with only a warning and no error.
+    xrt_bin = joinpath(xrt_jll.artifact_dir, "bin")
+    cmd = addenv(`$(aiecc()) $mlir_file $args`, "PATH" => xrt_bin * ":" * get(ENV, "PATH", ""))
+    run(cmd)
+    # aiecc can exit 0 having generated the NPU instructions but no xclbin -- a
+    # failed place/route or core compile that it does not propagate to its exit
+    # code. Catch it here, where the design is named, rather than letting it surface
+    # later as an opaque "could not open NPU design" at launch.
+    isfile(xclbin) || error(
+        "IRON: aiecc exited successfully but wrote no xclbin to $xclbin. The device \
+        artifacts are incomplete -- usually a place/route or per-core compile that \
+        aiecc did not flag. Re-run with `verbose = true` to see its output."
+    )
+    isfile(insts) || error("IRON: aiecc wrote no instruction stream to $insts")
     return (xclbin, insts)
 end
