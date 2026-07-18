@@ -99,14 +99,16 @@ function run_kernel(@nospecialize(f), @nospecialize(argtypes), arrays::AbstractA
 
     GC.@preserve engine storage descriptors begin
         ptrs = [Base.unsafe_convert(Ptr{Cvoid}, d) for d in descriptors]
-        if length(ptrs) == 2
+        if length(ptrs) == 1
+            @ccall $fptr(ptrs[1]::Ptr{Cvoid})::Cvoid
+        elseif length(ptrs) == 2
             @ccall $fptr(ptrs[1]::Ptr{Cvoid}, ptrs[2]::Ptr{Cvoid})::Cvoid
         elseif length(ptrs) == 3
             @ccall $fptr(
                 ptrs[1]::Ptr{Cvoid}, ptrs[2]::Ptr{Cvoid}, ptrs[3]::Ptr{Cvoid}
             )::Cvoid
         else
-            error("IRON: jit test supports 2 or 3 arguments, got $(length(ptrs))")
+            error("IRON: jit test supports 1 to 3 arguments, got $(length(ptrs))")
         end
     end
 

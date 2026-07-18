@@ -62,13 +62,14 @@ include("compiler/aiecc.jl")
 
 include("array.jl")
 include("runtime.jl")
+include("gemm.jl")
 
 export Tile, Vec
 export vload, vstore!, vbroadcast, vconvert
 export AIEDevice, npu1, npu2
 export ObjectFifo, Endpoint, producer, consumer
 export Worker, Runtime, start!, drain!, Program
-export generate_mlir
+export generate_mlir, gemm_program
 export NPUArray, @allowscalar
 
 end # module

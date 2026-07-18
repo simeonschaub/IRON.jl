@@ -125,7 +125,7 @@ the first [`run!`](@ref) and reused thereafter; they are released when the
 `CompiledProgram` is finalized.
 """
 mutable struct CompiledProgram
-    program::Program
+    nargs::Int            # number of runtime-sequence buffers the design takes
     xclbin::String
     insts::Vector{UInt32}
     ctx::Ptr{Cvoid}       # xclbin+hw_context+kernel; C_NULL until first run
@@ -151,15 +151,18 @@ end
 """
     compile(program; path=nothing, workdir=mktempdir(), flags=String[], verbose=false)
         -> CompiledProgram
+    compile(mlir::AbstractString, nargs; kwargs...) -> CompiledProgram
 
-Generate `program`'s MLIR, compile it to an NPU xclbin + instruction stream with
-`aiecc`/Peano, and wrap the result. `path`, if given, is where the `.mlir` is
-written; otherwise it goes under `workdir`. `flags` are passed through to `aiecc`
-(e.g. `["--alloc-scheme=basic-sequential"]`). `peano` overrides the Peano/llvm-aie
-install used for per-core codegen and linking (see [`aiecc_compile`](@ref)).
+Compile a design to an NPU xclbin + instruction stream with `aiecc`/Peano, and wrap
+the result. The first form generates `program`'s MLIR; the second takes MLIR text
+directly (e.g. from [`gemm_program`](@ref)) together with `nargs`, the number of
+runtime-sequence buffers it takes. `path`, if given, is where the `.mlir` is written;
+otherwise it goes under `workdir`. `flags` are passed through to `aiecc` (e.g.
+`["--alloc-scheme=basic-sequential"]`). `peano` overrides the Peano/llvm-aie install
+used for per-core codegen and linking (see [`aiecc_compile`](@ref)).
 """
 function compile(
-    p::Program;
+    mlir::AbstractString, nargs::Integer;
     path::Union{Nothing, AbstractString} = nothing,
     workdir::AbstractString = mktempdir(),
     peano::AbstractString = Peano_jll.artifact_dir,
@@ -167,12 +170,13 @@ function compile(
     verbose::Bool = false,
 )
     isdir(workdir) || mkpath(workdir)
-    mlir = generate_mlir(p)
     mlir_file = path === nothing ? joinpath(workdir, "aie.mlir") : String(path)
     write(mlir_file, mlir)
     xclbin, insts = aiecc_compile(mlir_file; workdir, peano, flags, verbose)
-    return CompiledProgram(p, xclbin, _load_insts(insts), C_NULL, C_NULL)
+    return CompiledProgram(Int(nargs), xclbin, _load_insts(insts), C_NULL, C_NULL)
 end
+
+compile(p::Program; kwargs...) = compile(generate_mlir(p), length(p.argtypes); kwargs...)
 
 # Open the launch context on first use and cache it, registering the finalizer
 # that will release it (and the instruction buffer).
@@ -209,8 +213,8 @@ the host with `Array`.
 The first call opens the device and loads the xclbin; later calls reuse them.
 """
 function run!(c::CompiledProgram, arrays::NPUArray...)
-    length(arrays) == length(c.program.argtypes) || error(
-        "IRON: design takes $(length(c.program.argtypes)) buffers, got $(length(arrays))"
+    length(arrays) == c.nargs || error(
+        "IRON: design takes $(c.nargs) buffers, got $(length(arrays))"
     )
     ctx = _context!(c)
     instr = _instr_bo!(c, ctx)
