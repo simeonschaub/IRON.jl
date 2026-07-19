@@ -3,9 +3,9 @@
 # host DMA and the compile/run cycle -- the way `@cuda kernel(a, b, c)` hides the
 # grid/stream machinery of a CUDA launch.
 #
-# This sits on top of the `Program`/`Worker`/`Runtime` layer in `dataflow.jl` and
-# the tiled host-DMA machinery it shares with `gemm.jl`. It targets a single compute
-# tile with one host transfer stream per buffer. Two shapes are supported:
+# This sits on top of the `Program`/`Worker`/`Runtime` layer in `dataflow.jl`. It
+# targets a single compute tile with one host transfer stream per buffer. Two shapes
+# are supported:
 #
 #   * whole-buffer (the default): each NPUArray moves as a single tile, the kernel
 #     runs once -- the elementwise/whole-array case (`add_one`).
@@ -16,11 +16,11 @@
 #     launch drives it over the tile grid, much as a CUDA grid runs a thread block per
 #     chunk.
 #
-# What this deliberately does NOT cover is a *reduction* like GEMM, where the output
-# tile is held across an inner loop that streams the input operands at a different
-# rate and accumulates -- and where each operand's tile is indexed by a different
-# combination of the loop variables. That schedule cannot be read off the kernel; it
-# is spelled out by hand in `gemm.jl` and stays there.
+# What this call form deliberately does NOT cover is a *reduction* like GEMM, where the
+# output tile is held across an inner loop that streams the input operands at a
+# different rate and accumulates -- and where each operand's tile is indexed by a
+# different combination of the loop variables. That schedule cannot be read off the
+# kernel; it is spelled out with `@iron`'s `for` form (see `schedule.jl`).
 #
 # Unlike a GPU, where every argument is just resident memory the kernel reads and
 # writes at will, an AIE buffer streams through a *unidirectional* object FIFO: it
@@ -126,7 +126,7 @@ function _tile_pattern(bufdims::NTuple{2, Int}, tdims::NTuple{2, Int}, g::NTuple
 end
 _tile_pattern(bufdims::NTuple{N}, _, _) where {N} = error(
     "IRON: @iron streams 1-D and 2-D buffers in tiles; got a $(N)-D buffer. A design \
-    that tiles a higher-rank buffer needs a hand-written program (see `gemm.jl`)."
+    that tiles a higher-rank buffer needs a hand-written `Program`."
 )
 
 # --- design assembly ---------------------------------------------------------
@@ -161,7 +161,7 @@ end
 # The host DMA for a tiled map: for each tile position, in the shared grid order,
 # start the input transfers that feed the core and the output transfers that drain
 # it, then wait for the outputs before moving on -- bounding the in-flight descriptors
-# to one tile, the same discipline `gemm.jl` uses per output tile.
+# to one tile, the same discipline the `for`-form reduction uses per output tile.
 function _emit_tiled_runtime!(ctx::IR.Context, dirs, buffer_types, tile_types, coords)
     arg_types = IR.Type[memref_type(ctx, T) for T in buffer_types]
     body = IR.Block(arg_types, [loc(ctx) for _ in arg_types])
@@ -290,9 +290,10 @@ end
 """
     @iron [option = value...] kernel(In(a), Out(b), ...)
     @iron [option = value...] for <space axes>
-        @init  init_kernel(outputs...)
-        step_kernel(In(a)[axes...], Out(c)[axes...], ...)
-        @reduce axis = extent
+        @init init_kernel(outputs...)
+        @reduce for <reduce axes>
+            step_kernel(In(a)[axes...], Out(c)[axes...], ...)
+        end
     end
 
 Compile and run a single-core NPU design straight from a kernel and the buffers it
@@ -319,19 +320,20 @@ grid, so the k-th tile of each corresponds.
 
 A reduction accumulates an output tile across an inner loop that streams the inputs
 at a different rate -- a schedule that cannot be read off the kernels, so it is
-written as a `for` loop whose header is the **output-tile iteration** (the space
-axes) and whose body declares the operands and the reduction:
+written as a loop nest: the outer `for` header is the **output-tile iteration** (the
+space axes), and a nested `@reduce for` is the accumulation loop.
 
-  * the **step** call names the per-step kernel and every operand as `In(a)[axes...]`
-    or `Out(c)[axes...]`; the bracketed axes are the tile access (which loop variables
-    index that buffer, one per dimension), and the argument order is the kernel's.
   * `@init k(outputs...)` names a kernel run on the `Out`/accumulator tiles once per
     output tile (e.g. zeroing); omit it for none.
-  * `@reduce axis = extent` (or `axis in range`) declares a reduction axis -- the inner
-    loop the step accumulates over. Omit for a pure per-tile map.
+  * `@reduce for <axes> ... end` declares the reduction axes in its header, and its
+    body is the **step** call -- the per-step kernel with every operand written
+    `In(a)[axes...]` or `Out(c)[axes...]`, where the bracketed axes are the tile access
+    (which loop variables index that buffer, one per dimension) and the argument order
+    is the kernel's. For a pure per-tile map (no reduction), write the step call
+    directly in the space body with no `@reduce`.
 
 A tile shape is inferred from the buffer and the extents of the axes indexing it, so
-none is annotated. See [`gemm_program`](@ref) for the equivalent hand-written design.
+none is annotated.
 
 ## Common behaviour
 
@@ -350,10 +352,11 @@ more than the 1024-byte default).
 @iron add_one(In(a)::Tile{Int32,Tuple{1024}}, Out(b)::Tile{Int32,Tuple{1024}})
 
 # reduction: C = A * B in (m,k) x (k,n) tiles reduced on one core
-@iron stack_size = 3328 flags = ["--alloc-scheme=basic-sequential"] for mi in 1:M÷m, nj in 1:N÷n
+@iron stack_size = 3328 flags = ["--alloc-scheme=basic-sequential"] for mi in 1:div(M, m), nj in 1:div(N, n)
     @init gemm_zero!(C)
-    gemm_acc!(In(A)[mi, kk], In(B)[kk, nj], Out(C)[mi, nj])
-    @reduce kk = K÷k
+    @reduce for kk in 1:div(K, k)
+        gemm_acc!(In(A)[mi, kk], In(B)[kk, nj], Out(C)[mi, nj])
+    end
 end
 ```
 
