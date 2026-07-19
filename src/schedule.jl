@@ -147,13 +147,22 @@ function _schedule_launch(
             "IRON: L2 `broadcast` operand $(s.name) is indexed by a `@cores` axis; it is not \
             shared across the cores -- use `distribute` (or drop the explicit pattern)"
         )
-        # distribute/join fan a single MemTile out to (in from) one FIFO per core, so each
-        # needs `num_cores` of the memtile's ~6 DMA channels. Beyond that a single memtile
-        # cannot serve every core -- the per-column memtile grid (a later increment) will.
-        s.l2pattern in (:distribute, :join) && num_cores > 5 && error(
-            "IRON: L2 `$(s.l2pattern)` operand $(s.name) needs one MemTile DMA channel per \
-            core, but a memtile has only ~6; $(num_cores) cores exceeds a single memtile \
-            (the per-column memtile grid is not implemented yet)"
+        # distribute/join partition the cores along a single `@cores` axis into groups, one
+        # memtile each; a second spatial axis (a 2D grid) is not handled yet.
+        s.l2pattern in (:distribute, :join) && length(spatial) > 1 && error(
+            "IRON: L2 `$(s.l2pattern)` operand $(s.name) needs a single `@cores` axis; \
+            distribute/join over a 2D core grid is not implemented yet"
+        )
+    end
+    # Each broadcast operand takes one memtile, each distribute/join one per core group;
+    # npu2 has 8 memtile columns.
+    if any(s -> s.l2pattern !== nothing, specs)
+        ngroups = length(_core_groups(num_cores))
+        nmem = count(s -> s.l2pattern === :broadcast, specs) +
+               ngroups * count(s -> s.l2pattern in (:distribute, :join), specs)
+        nmem <= 8 || error(
+            "IRON: this L2 design needs $nmem MemTiles but npu2 has 8; use fewer cores or \
+            fewer L2 operands until distribute+join share a memtile per column"
         )
     end
 
@@ -278,32 +287,33 @@ function _emit_schedule_runtime!(ctx::IR.Context, specs, spatial, temporal, redu
 
     core_names = Set(nm for (nm, _) in spatial)
     grid_of(s, coord) = Tuple(coord[a] for a in s.access)
-    # The super-tile spans every spatial position, so its grid index is 0 on the `@cores`
-    # axes and the loop coordinate elsewhere.
-    super_grid(s, coord) = Tuple(a in core_names ? 0 : coord[a] for a in s.access)
+    # A group's super-tile is the `gidx`-th tile of `gsize` core slices along the `@cores`
+    # axes, so its grid index there is the group index and the loop coordinate elsewhere.
+    group_grid(s, coord, gidx) = Tuple(a in core_names ? gidx : coord[a] for a in s.access)
 
     # Shared inputs (broadcast/distribute) cross DDR once into the shim->memtile FIFO; the
-    # memtile fans them out. Distribute moves the whole super-tile, broadcast a plain tile.
-    # Direct inputs are fed per core; join outputs are drained once as a super-tile.
+    # memtile fans them out. Distribute moves a group's super-tile, broadcast a plain tile.
+    # Direct inputs are fed per core; join outputs are drained per group as super-tiles.
     bcast_in = [i for (i, s) in enumerate(specs) if s.dir === :in && s.l2pattern === :broadcast]
     dist_in = [i for (i, s) in enumerate(specs) if s.dir === :in && s.l2pattern === :distribute]
     direct_in = [i for (i, s) in enumerate(specs) if s.dir === :in && s.l2pattern === nothing]
     join_out = [i for (i, s) in enumerate(specs) if s.dir === :out && s.l2pattern === :join]
     direct_out = [i for (i, s) in enumerate(specs) if s.dir === :out && s.l2pattern === nothing]
     core_coords = _axis_coords(spatial)   # one spatial coordinate per core
+    groups = _core_groups(num_cores)
 
     for tc in _axis_coords(temporal)
         # A sliding window of in-flight input BDs, one queue per FIFO -- per (operand, core)
-        # for direct inputs, per operand for the shared broadcast/distribute ones. The shim
-        # runs at most `FIFO_DEPTH` tiles ahead of a core before its object FIFO
+        # for direct inputs, per (operand, group) for the shared broadcast/distribute ones.
+        # The shim runs at most `FIFO_DEPTH` tiles ahead of a core before its object FIFO
         # backpressures, so configuring more up front buys no overlap and just burns buffer
         # descriptors (a tile holds at most 16). Await + free the oldest before the next.
         inflight = Dict{Any, Vector{IR.Value}}()
         for i in bcast_in
-            inflight[(:shared, i)] = IR.Value[]
+            inflight[(:shared, i, 0)] = IR.Value[]
         end
-        for i in dist_in
-            inflight[(:shared, i)] = IR.Value[]
+        for i in dist_in, gidx in eachindex(groups)
+            inflight[(:shared, i, gidx)] = IR.Value[]
         end
         for i in direct_in, c in 0:(num_cores - 1)
             inflight[(i, c)] = IR.Value[]
@@ -315,14 +325,14 @@ function _emit_schedule_runtime!(ctx::IR.Context, specs, spatial, temporal, redu
         # first would gate the next core on this core's progress and serialise them.
         for rc in _axis_coords(reduction)
             for i in bcast_in                       # shared tile, once for all cores
-                q = inflight[(:shared, i)]
+                q = inflight[(:shared, i, 0)]
                 length(q) >= FIFO_DEPTH && retire(popfirst!(q))
                 push!(q, task(i, "op$(i)_l3l2", size(specs[i].tile_type), grid_of(specs[i], merge(tc, rc)); token = true))
             end
-            for i in dist_in                        # whole super-tile, sliced per core by the link
-                q = inflight[(:shared, i)]
+            for i in dist_in, (gidx, group) in enumerate(groups)   # a group's super-tile, sliced per core by the link
+                q = inflight[(:shared, i, gidx)]
                 length(q) >= FIFO_DEPTH && retire(popfirst!(q))
-                push!(q, task(i, "op$(i)_l3l2", _super_dims(specs[i], core_names), super_grid(specs[i], merge(tc, rc)); token = true))
+                push!(q, task(i, "op$(i)_l3l2_g$(gidx - 1)", _super_dims(specs[i], core_names, length(group)), group_grid(specs[i], merge(tc, rc), gidx - 1); token = true))
             end
             for (c, sc) in enumerate(core_coords)
                 cidx = c - 1
@@ -335,11 +345,11 @@ function _emit_schedule_runtime!(ctx::IR.Context, specs, spatial, temporal, redu
             end
         end
 
-        # Drain each core's output -- per core for direct outputs, once as a super-tile for
-        # a join -- wait on them all, then retire the trailing inputs.
+        # Drain each core's output -- per core for direct outputs, per group as a super-tile
+        # for a join -- wait on them all, then retire the trailing inputs.
         outs = IR.Value[]
-        for i in join_out
-            push!(outs, task(i, "op$(i)_l2l3", _super_dims(specs[i], core_names), super_grid(specs[i], tc); token = true))
+        for i in join_out, (gidx, group) in enumerate(groups)
+            push!(outs, task(i, "op$(i)_l2l3_g$(gidx - 1)", _super_dims(specs[i], core_names, length(group)), group_grid(specs[i], tc, gidx - 1); token = true))
         end
         for (c, sc) in enumerate(core_coords)
             cidx = c - 1
@@ -350,10 +360,10 @@ function _emit_schedule_runtime!(ctx::IR.Context, specs, spatial, temporal, redu
         for o in outs
             push!(body, dma_await_task_op(ctx, o))
         end
-        for i in bcast_in, t in inflight[(:shared, i)]
+        for i in bcast_in, t in inflight[(:shared, i, 0)]
             retire(t)
         end
-        for i in dist_in, t in inflight[(:shared, i)]
+        for i in dist_in, gidx in eachindex(groups), t in inflight[(:shared, i, gidx)]
             retire(t)
         end
         for c in 0:(num_cores - 1), i in direct_in, t in inflight[(i, c)]
@@ -369,26 +379,39 @@ _fifo_name(i, c, num_cores) = num_cores == 1 ? "op$i" : "op$(i)_c$c"
 
 _retile(::Type{Tile{T, D}}, dims) where {T, D} = Tile{T, Tuple{dims...}}
 
-# The MemTile-level "super-tile" of an L2 distribute/join operand: it spans all spatial
-# (core) positions along the axes the cores partition and one temporal/reduce position
-# along the rest -- so its dims are the buffer dims on the `@cores` axes and the per-core
-# tile dims elsewhere. The DDR<->MemTile DMA moves the whole super-tile; the link then
-# slices it per core.
-function _super_dims(s, core_names)
-    bufdims, tdims = size(s.buffer_type), size(s.tile_type)
-    ntuple(length(bufdims)) do d
-        s.access[d] in core_names ? bufdims[d] : tdims[d]
+# A single memtile can only fan out to (in from) one FIFO per core over its DMA channels,
+# so distribute/join partition the cores into groups of at most `L2_GROUP`, one memtile per
+# group. This matches the npu2 column shape (4 compute rows per memtile).
+const L2_GROUP = 4
+
+# The 0-based core indices in each group, in order.
+function _core_groups(num_cores)
+    num_cores <= L2_GROUP && return [collect(0:(num_cores - 1))]
+    num_cores % L2_GROUP == 0 || error(
+        "IRON: with L2 distribute/join the core count ($num_cores) must be a multiple of \
+        L2_GROUP ($L2_GROUP)"
+    )
+    return [collect(g:(g + L2_GROUP - 1)) for g in 0:L2_GROUP:(num_cores - 1)]
+end
+
+# The MemTile-level "super-tile" one group's memtile moves in a single DDR<->L2 DMA: it
+# spans `gsize` core slices along the `@cores` axes and one temporal/reduce position
+# elsewhere. The link then slices it per core.
+function _super_dims(s, core_names, gsize)
+    tdims = size(s.tile_type)
+    ntuple(length(tdims)) do d
+        s.access[d] in core_names ? gsize * tdims[d] : tdims[d]
     end
 end
 
-# Column-major element offset of the sub-tile a core at spatial coordinate `sc` owns,
-# within its operand's super-tile -- the `src_offsets`/`dst_offsets` an `objectfifo.link`
-# needs to place each core's slice.
-function _sub_offset(s, sc, core_names)
-    superd, tdims = _super_dims(s, core_names), size(s.tile_type)
+# Column-major element offset of a core's sub-tile within its group's super-tile, given the
+# group's spatial `base` coordinate -- the `src_offsets`/`dst_offsets` the link needs.
+function _sub_offset(s, sc, core_names, gsize, base)
+    superd, tdims = _super_dims(s, core_names, gsize), size(s.tile_type)
     off, stride = 0, 1
     for d in eachindex(superd)
-        pos = s.access[d] in core_names ? sc[s.access[d]] * tdims[d] : 0
+        a = s.access[d]
+        pos = a in core_names ? (sc[a] - get(base, a, 0)) * tdims[d] : 0
         off += pos * stride
         stride *= superd[d]
     end
@@ -440,55 +463,66 @@ function _build_schedule_program(
         # direct operands get a per-core shim FIFO afterwards.
         corefifo = [Dict{Int, String}() for _ in 1:num_cores]
 
-        # L2 operands route DDR<->shim<->MemTile<->cores through a linked pair of FIFOs
-        # sharing the memtile (`aie.objectfifo.link`), so the operand crosses DDR once and
-        # fans out/in on-chip instead of using a shim channel per core:
-        #   broadcast  -- shared input: l3l2 -> l2l1 with every core a consumer;
-        #   distribute -- per-core input: l3l2 (super-tile) -> one l2l1 per core, dst_offsets
-        #                 slicing each core's tile out of the super-tile;
-        #   join       -- per-core output: one l1l2 per core -> l2l3 (super-tile), src_offsets.
+        # L2 operands route DDR<->shim<->MemTile<->cores through linked FIFOs sharing a
+        # memtile (`aie.objectfifo.link`), so the operand crosses DDR once and fans out/in
+        # on-chip instead of using a shim channel per core:
+        #   broadcast  -- shared input: one memtile, l3l2 -> l2l1 with every core a consumer;
+        #   distribute -- per-core input: per group of cores a memtile, l3l2 (super-tile) ->
+        #                 one l2l1 per core, dst_offsets slicing each core's tile out;
+        #   join       -- per-core output: per group a memtile, one l1l2 per core -> l2l3
+        #                 (super-tile), src_offsets. Grouping keeps within a memtile's DMA
+        #                 channels and maps onto the npu2 columns.
+        groups = _core_groups(num_cores)
         for (i, s) in enumerate(specs)
             s.l2pattern === nothing && continue
-            mem = logical_tile_op(ctx, MemTile)
-            push!(device_body, mem)
-            shim = logical_tile_op(ctx, ShimNOCTile)
-            push!(device_body, shim)
-            mem_tile, shim_tile = IR.result(mem, 1), IR.result(shim, 1)
             tile_of = objectfifo_type(ctx, s.tile_type)
-            super_of = objectfifo_type(ctx, _retile(s.tile_type, _super_dims(s, core_names)))
 
             if s.l2pattern === :broadcast
+                mem = logical_tile_op(ctx, MemTile); push!(device_body, mem)
+                shim = logical_tile_op(ctx, ShimNOCTile); push!(device_body, shim)
                 l3l2, l2l1 = "op$(i)_l3l2", "op$(i)_l2l1"
-                push!(device_body, objectfifo_op(ctx, l3l2, shim_tile, IR.Value[mem_tile], tile_of, FIFO_DEPTH))
-                push!(device_body, objectfifo_op(ctx, l2l1, mem_tile, core_tiles, tile_of, FIFO_DEPTH))
+                push!(device_body, objectfifo_op(ctx, l3l2, IR.result(shim, 1), IR.Value[IR.result(mem, 1)], tile_of, FIFO_DEPTH))
+                push!(device_body, objectfifo_op(ctx, l2l1, IR.result(mem, 1), core_tiles, tile_of, FIFO_DEPTH))
                 push!(device_body, objectfifo_link_op(ctx, [l3l2], [l2l1]))
                 for c in 1:num_cores
                     corefifo[c][i] = l2l1
                 end
-            elseif s.l2pattern === :distribute
-                l3l2 = "op$(i)_l3l2"
-                push!(device_body, objectfifo_op(ctx, l3l2, shim_tile, IR.Value[mem_tile], super_of, FIFO_DEPTH))
-                outs = String[]
-                for c in 1:num_cores
-                    l2l1 = "op$(i)_l2l1_c$(c - 1)"
-                    push!(device_body, objectfifo_op(ctx, l2l1, mem_tile, IR.Value[core_tiles[c]], tile_of, FIFO_DEPTH))
-                    push!(outs, l2l1)
-                    corefifo[c][i] = l2l1
+                continue
+            end
+
+            # distribute/join: one memtile + shim per group of cores.
+            for (gidx, group) in enumerate(groups)
+                gsize = length(group)
+                base = Dict(a => (gidx - 1) * L2_GROUP for a in core_names)
+                super_of = objectfifo_type(ctx, _retile(s.tile_type, _super_dims(s, core_names, gsize)))
+                offs = [_sub_offset(s, core_coords[c + 1], core_names, gsize, base) for c in group]
+                mem = logical_tile_op(ctx, MemTile); push!(device_body, mem)
+                shim = logical_tile_op(ctx, ShimNOCTile); push!(device_body, shim)
+                mem_tile, shim_tile = IR.result(mem, 1), IR.result(shim, 1)
+
+                if s.l2pattern === :distribute
+                    l3l2 = "op$(i)_l3l2_g$(gidx - 1)"
+                    push!(device_body, objectfifo_op(ctx, l3l2, shim_tile, IR.Value[mem_tile], super_of, FIFO_DEPTH))
+                    outs = String[]
+                    for c in group
+                        l2l1 = "op$(i)_l2l1_c$(c)"
+                        push!(device_body, objectfifo_op(ctx, l2l1, mem_tile, IR.Value[core_tiles[c + 1]], tile_of, FIFO_DEPTH))
+                        push!(outs, l2l1)
+                        corefifo[c + 1][i] = l2l1
+                    end
+                    push!(device_body, objectfifo_link_op(ctx, [l3l2], outs; dst_offsets = offs))
+                else # :join
+                    l2l3 = "op$(i)_l2l3_g$(gidx - 1)"
+                    push!(device_body, objectfifo_op(ctx, l2l3, mem_tile, IR.Value[shim_tile], super_of, FIFO_DEPTH))
+                    ins = String[]
+                    for c in group
+                        l1l2 = "op$(i)_l1l2_c$(c)"
+                        push!(device_body, objectfifo_op(ctx, l1l2, core_tiles[c + 1], IR.Value[mem_tile], tile_of, FIFO_DEPTH))
+                        push!(ins, l1l2)
+                        corefifo[c + 1][i] = l1l2
+                    end
+                    push!(device_body, objectfifo_link_op(ctx, ins, [l2l3]; src_offsets = offs))
                 end
-                dst = [_sub_offset(s, sc, core_names) for sc in core_coords]
-                push!(device_body, objectfifo_link_op(ctx, [l3l2], outs; dst_offsets = dst))
-            else # :join
-                l2l3 = "op$(i)_l2l3"
-                push!(device_body, objectfifo_op(ctx, l2l3, mem_tile, IR.Value[shim_tile], super_of, FIFO_DEPTH))
-                ins = String[]
-                for c in 1:num_cores
-                    l1l2 = "op$(i)_l1l2_c$(c - 1)"
-                    push!(device_body, objectfifo_op(ctx, l1l2, core_tiles[c], IR.Value[mem_tile], tile_of, FIFO_DEPTH))
-                    push!(ins, l1l2)
-                    corefifo[c][i] = l1l2
-                end
-                src = [_sub_offset(s, sc, core_names) for sc in core_coords]
-                push!(device_body, objectfifo_link_op(ctx, ins, [l2l3]; src_offsets = src))
             end
         end
 
