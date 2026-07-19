@@ -657,6 +657,21 @@ end
         @test occursin("sym_name = \"op2_l3l2_g1\"", gmlir)   # second distribute group
         @test occursin("sym_name = \"op3_l2l3_g1\"", gmlir)   # second join group
         @test occursin("sym_name = \"op2_l2l1_c7\"", gmlir)   # global core index 7
+
+        # 32 cores = 8 groups fill all 8 memtile columns, so A folds onto a group memtile
+        # rather than needing a 9th: exactly 8 MemTiles for the whole array. (M=K=64, N=512
+        # -> nj = 32 cores, mi = 4 temporal, kk = 2 reduce.)
+        big = [
+            spec(:in, BFloat16, (64, 64), (16, 32), [:mi, :kk], "op1"; l2 = :broadcast),
+            spec(:in, BFloat16, (64, 512), (32, 16), [:kk, :nj], "op2"; l2 = :distribute),
+            spec(:out, Float32, (64, 512), (16, 16), [:mi, :nj], "op3"; l2 = :join),
+        ]
+        bigmlir = IRON._build_schedule_program(
+            gemm_zero!, gemm_acc!, big, [(:nj, 32)], [(:mi, 4)], [(:kk, 2)],
+            IRON.npu2, "main", 3328,
+        )
+        @test count("tile_type = 0 : i32", bigmlir) == 32    # full 32-core array
+        @test count("tile_type = 1 : i32", bigmlir) == 8     # 8 group memtiles, A folded in
     end
 
     @testset "generated module round-trips" begin
