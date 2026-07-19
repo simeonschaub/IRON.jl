@@ -11,7 +11,7 @@ A design is described with object FIFOs and workers, following the structure of
 MLIR-AIE's Python IRON API. The difference is the compute kernel: instead of
 writing it in a tracing DSL or in C++, you write an ordinary Julia function.
 It is type-inferred, structurized with
-[IRStructurizer](https://github.com/simeonschaub/IRStructurizer.jl) and lowered to
+[IRStructurizer](https://github.com/maleadt/IRStructurizer.jl) and lowered to
 `scf`/`arith`/`memref` through [MLIR.jl](https://github.com/JuliaLabs/MLIR.jl),
 then spliced into the `aie.core` body.
 
