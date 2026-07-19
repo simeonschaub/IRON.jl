@@ -77,12 +77,15 @@ function objectfifo_op(
         ctx, sym_name::AbstractString, producer::IR.Value, consumers::Vector{IR.Value},
         elem_type::IR.Type, depth::Integer,
     )
+    # `dimensionsFromStreamPerConsumer` carries one access-pattern list *per consumer*, so
+    # a broadcast FIFO (several consumers) needs one empty entry each -- `[[], [], ...]`.
+    # A single consumer keeps the original `[[]]`.
+    per_consumer = "#aie<bd_dim_layout_array_array[" * join(fill("[]", length(consumers)), ", ") * "]>"
     return create_op(
         "aie.objectfifo", loc(ctx);
         operands = IR.Value[producer, consumers...],
         properties = [
-            "dimensionsFromStreamPerConsumer" =>
-                opaque_attr("#aie<bd_dim_layout_array_array[[]]>"; context = ctx),
+            "dimensionsFromStreamPerConsumer" => opaque_attr(per_consumer; context = ctx),
             "dimensionsToStream" => opaque_attr("#aie<bd_dim_layout_array[]>"; context = ctx),
             "disable_synchronization" => IR.Attribute(false; context = ctx),
             "elemNumber" => i32(depth, ctx),
