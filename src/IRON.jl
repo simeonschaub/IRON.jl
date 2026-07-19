@@ -66,8 +66,8 @@ include("runtime.jl")
 include("launch.jl")
 include("schedule.jl")
 
-export Tile, Vec
-export vload, vstore!, vbroadcast, vconvert
+export Tile, Vec, Mat
+export vload, vstore!, vbroadcast, vconvert, vmatmul
 export AIEDevice, npu1, npu2
 export ObjectFifo, Endpoint, producer, consumer
 export Worker, Runtime, start!, drain!, Program
