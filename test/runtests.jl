@@ -620,6 +620,30 @@ end
         @test occursin("sym_name = \"op1_l2l1\"", bmlir)
         @test !occursin("sym_name = \"op1_c0\"", bmlir)    # no per-core FIFO for A
         @test occursin("sym_name = \"op2_c0\"", bmlir)     # B still per-core
+
+        # Every operand on L2: A broadcast, B distribute, C join. Three memtiles + links,
+        # per-core distribute/join FIFOs, and no per-core shim FIFOs at all.
+        lspecs = [
+            spec(:in, BFloat16, (M, K), (m, k), [:mi, :kk], "op1"; l2 = :broadcast),
+            spec(:in, BFloat16, (K, N), (k, n), [:kk, :nj], "op2"; l2 = :distribute),
+            spec(:out, Float32, (M, N), (m, n), [:mi, :nj], "op3"; l2 = :join),
+        ]
+        lmlir = IRON._build_schedule_program(
+            gemm_zero!, gemm_acc!, lspecs, spatial, temporal, reduction,
+            IRON.npu2, "main", 3328,
+        )
+        @test count("tile_type = 1 : i32", lmlir) == 3        # three MemTiles
+        @test count("aie.objectfifo.link", lmlir) == 3
+        for c in 0:(N ÷ n - 1)
+            @test occursin("sym_name = \"op2_l2l1_c$(c)\"", lmlir)   # B distributed per core
+            @test occursin("sym_name = \"op3_l1l2_c$(c)\"", lmlir)   # C joined per core
+        end
+        @test occursin("sym_name = \"op2_l3l2\"", lmlir)
+        @test occursin("sym_name = \"op3_l2l3\"", lmlir)
+        @test !occursin("sym_name = \"op1_c0\"", lmlir)      # no direct per-core FIFOs
+        @test !occursin("sym_name = \"op3_c0\"", lmlir)
+        # Distribute slices B by column: dst offsets c*(k*n) = 0, 512, 1024, 1536.
+        @test occursin("512", lmlir) && occursin("1536", lmlir)
     end
 
     @testset "generated module round-trips" begin
