@@ -75,16 +75,17 @@ if get(ENV, "IRON_RUN", "0") == "1"
 
     # C = A * B, in (m, k) x (k, n) tiles. `@cores nj` spreads the output columns across
     # the compute-core array -- here N/n = 4 cores, each reducing its own column of output
-    # tiles concurrently. `da` is not indexed by `nj`, so every core reads the same A
-    # tiles: `L2(In(da))` routes A through a MemTile and broadcasts it on-chip (one DDR
-    # read fanned to all cores) instead of each core re-reading it from DDR. Tile shapes
-    # are inferred from each buffer and the axis extents indexing it (e.g. da is M x K
-    # indexed by (mi, kk) of extent (M/m, K/k), giving an m x k tile).
+    # tiles concurrently. Every operand is routed through a MemTile with `L2(...)`, so it
+    # crosses DDR once and fans out/in on-chip instead of using a shim channel per core.
+    # The pattern is inferred from the access axes: `da` (not indexed by `nj`) broadcasts
+    # to all cores, `db` (indexed by `nj`) is distributed one column-slice per core, and
+    # the output `dc` is joined from the per-core tiles into one drain. Tile shapes follow
+    # from each buffer and the axis extents indexing it.
     @iron stack_size = 3328 flags = AIECC_FLAGS for mi in 1:div(M, m), nj in 1:div(N, n)
         @cores nj
         @init gemm_zero!(dc)
         @reduce for kk in 1:div(K, k)
-            gemm_acc!(L2(In(da))[mi, kk], In(db)[kk, nj], Out(dc)[mi, nj])
+            gemm_acc!(L2(In(da))[mi, kk], L2(In(db))[kk, nj], L2(Out(dc))[mi, nj])
         end
     end
 
