@@ -558,14 +558,26 @@ end
         @test_throws Exception IRON._build_iron_schedule(bad, Expr[])
     end
 
+    @testset "L2 operand parsing" begin
+        # `L2(...)` wraps an operand for MemTile forwarding; the pattern is optional.
+        @test IRON._parse_operand(:(L2(In(da))[mi, kk])) == (:in, :da, [:mi, :kk], true, nothing)
+        @test IRON._parse_operand(:(L2(In(db); distribute)[kk, nj])) == (:in, :db, [:kk, :nj], true, :distribute)
+        @test IRON._parse_operand(:(L2(In(db), broadcast)[kk, nj])) == (:in, :db, [:kk, :nj], true, :broadcast)
+        @test IRON._parse_operand(:(L2(Out(dc); join)[mi, nj])) == (:out, :dc, [:mi, :nj], true, :join)
+        # Bare operands are unchanged.
+        @test IRON._parse_operand(:(In(da)[mi, kk])) == (:in, :da, [:mi, :kk], false, nothing)
+        # An unknown pattern is rejected.
+        @test_throws Exception IRON._parse_operand(:(L2(In(da); scatter)[mi, kk]))
+    end
+
     @testset "multi-core schedule module" begin
         # Build the operand specs the way `_schedule_launch` does (arrays are unused by
         # `_build_schedule_program`, so a placeholder suffices), then check the emitted
         # design has one core per spatial position with per-core FIFOs.
         m, k, n = 16, 32, 16
         M, K, N = 64, 64, 64
-        spec(dir, T, buf, tl, ax, nm) = (
-            dir = dir, array = nothing, access = ax, name = nm,
+        spec(dir, T, buf, tl, ax, nm; l2 = nothing) = (
+            dir = dir, array = nothing, access = ax, name = nm, l2pattern = l2,
             buffer_type = Tile{T, Tuple{buf...}}, tile_type = Tile{T, Tuple{tl...}},
         )
         specs = [
@@ -590,6 +602,24 @@ end
         for c in 0:(N ÷ n - 1), i in 1:3
             @test occursin("sym_name = \"op$(i)_c$(c)\"", mlir)
         end
+
+        # With op1 (A) marked L2 broadcast: a MemTile + an objectfifo.link relay appear,
+        # A is read from a single shared l2l1 FIFO, and A gets no per-core FIFO.
+        bspecs = [
+            spec(:in, BFloat16, (M, K), (m, k), [:mi, :kk], "op1"; l2 = :broadcast),
+            spec(:in, BFloat16, (K, N), (k, n), [:kk, :nj], "op2"),
+            spec(:out, Float32, (M, N), (m, n), [:mi, :nj], "op3"),
+        ]
+        bmlir = IRON._build_schedule_program(
+            gemm_zero!, gemm_acc!, bspecs, spatial, temporal, reduction,
+            IRON.npu2, "main", 3328,
+        )
+        @test count("tile_type = 1 : i32", bmlir) == 1    # one MemTile
+        @test occursin("aie.objectfifo.link", bmlir)
+        @test occursin("sym_name = \"op1_l3l2\"", bmlir)
+        @test occursin("sym_name = \"op1_l2l1\"", bmlir)
+        @test !occursin("sym_name = \"op1_c0\"", bmlir)    # no per-core FIFO for A
+        @test occursin("sym_name = \"op2_c0\"", bmlir)     # B still per-core
     end
 
     @testset "generated module round-trips" begin
