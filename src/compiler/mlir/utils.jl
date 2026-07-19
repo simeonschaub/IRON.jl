@@ -19,7 +19,7 @@ function context()
     API.mlirRegisterAllPasses()
     ctx = IR.Context(registry)
     IR.allow_unregistered_dialects!(true; context = ctx)
-    for dialect in ("func", "scf", "arith", "memref", "vector")
+    for dialect in ("func", "scf", "arith", "memref", "vector", "math")
         IR.get_or_load_dialect!(dialect; context = ctx)
     end
     return ctx
