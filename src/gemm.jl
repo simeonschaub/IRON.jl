@@ -11,21 +11,22 @@
 # large shapes want the loop/tap mechanism the faithful port would add.
 
 """
-    tile_access(R, K, tr, tc, ti, tj) -> (offset, dims, len)
+    tile_access(R, tr, tc, ti, tj) -> (offset, dims, len)
 
 The buffer-descriptor access pattern that gathers the `(ti, tj)`-th tile of size
-`(tr, tc)` out of a column-major `R`-row buffer whose column stride is `K` elements.
-`ti`/`tj` are 0-based tile coordinates.
+`(tr, tc)` out of a column-major buffer with `R` rows. `ti`/`tj` are 0-based tile
+coordinates.
 
 A `Tile` is column-major (see [`memref_type`](@ref)), so a tile is walked column by
 column: the innermost dimension steps one element `tr` times (down a column), the
-next steps `K` elements `tc` times (across columns). `offset` is the column-major
-linear index of the tile's top-left element. The two leading `(1, 0)` dims pad the
-pattern to the four dimensions the hardware buffer descriptor expects.
+next steps `R` elements `tc` times (across columns) -- `R`, the row count, is the
+column stride of a column-major buffer, *not* its column count. `offset` is the
+column-major linear index of the tile's top-left element. The two leading `(1, 0)`
+dims pad the pattern to the four dimensions the hardware buffer descriptor expects.
 """
-function tile_access(R::Int, K::Int, tr::Int, tc::Int, ti::Int, tj::Int)
+function tile_access(R::Int, tr::Int, tc::Int, ti::Int, tj::Int)
     offset = ti * tr + tj * tc * R
-    dims = Tuple{Int, Int}[(1, 0), (1, 0), (tc, K), (tr, 1)]
+    dims = Tuple{Int, Int}[(1, 0), (1, 0), (tc, R), (tr, 1)]
     return offset, dims, tr * tc
 end
 
@@ -102,9 +103,10 @@ function emit_gemm_runtime!(
 
     Mt, Kt, Nt = M ÷ m, K ÷ k, N ÷ n
 
-    # One DMA task feeding `alloc` from `buf`, gathering the given tile.
-    function fill_task(alloc, buf, R, Kdim, tr, tc, ti, tj; token)
-        offset, dims, len = tile_access(R, Kdim, tr, tc, ti, tj)
+    # One DMA task feeding `alloc` from `buf`, gathering the given tile. `R` is the
+    # row count (column stride) of the column-major buffer `buf`.
+    function fill_task(alloc, buf, R, tr, tc, ti, tj; token)
+        offset, dims, len = tile_access(R, tr, tc, ti, tj)
         bd = IR.Block(IR.Type[], IR.Location[])
         push!(bd, dma_bd_op(ctx, buf, dims, len; offset))
         push!(bd, end_op(ctx))
@@ -117,10 +119,12 @@ function emit_gemm_runtime!(
     for mi in 0:(Mt - 1), nj in 0:(Nt - 1)
         pending = IR.Value[]
         for kk in 0:(Kt - 1)
-            push!(pending, fill_task("inA", A, M, K, m, k, mi, kk; token = false))
-            push!(pending, fill_task("inB", B, K, N, k, n, kk, nj; token = false))
+            # A is M x K (row count M); B is K x N (row count K).
+            push!(pending, fill_task("inA", A, M, m, k, mi, kk; token = false))
+            push!(pending, fill_task("inB", B, K, k, n, kk, nj; token = false))
         end
-        ctask = fill_task("outC", C, M, N, m, n, mi, nj; token = true)
+        # C is M x N (row count M).
+        ctask = fill_task("outC", C, M, m, n, mi, nj; token = true)
         push!(body, dma_await_task_op(ctx, ctask))
         for t in pending
             push!(body, dma_free_task_op(ctx, t))
