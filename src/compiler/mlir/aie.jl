@@ -94,6 +94,30 @@ function objectfifo_op(
     )
 end
 
+# `aie.objectfifo.link`: relay object FIFOs through a shared link point (a MemTile), so a
+# DDR->L2->L1 movement is split across two FIFOs that share the memtile's DMA. With one
+# input and one output it is a straight forward/broadcast (the output FIFO's consumer list
+# decides the fan-out); several outputs is a distribute, whose `dst_offsets` slice the
+# shared buffer; several inputs is a join, with `src_offsets`. Offsets are in elements and
+# empty for a whole-object transfer. `ins`/`outs` are object-FIFO symbol names.
+function objectfifo_link_op(
+        ctx, ins::AbstractVector{<:AbstractString}, outs::AbstractVector{<:AbstractString};
+        src_offsets::AbstractVector{<:Integer} = Int[],
+        dst_offsets::AbstractVector{<:Integer} = Int[],
+    )
+    symrefs(names) = "[" * join(("@" * String(n) for n in names), ", ") * "]"
+    i64s(xs) = "[" * join(xs, ", ") * "]"
+    return create_op(
+        "aie.objectfifo.link", loc(ctx);
+        properties = [
+            "fifoIns" => opaque_attr(symrefs(ins); context = ctx),
+            "fifoOuts" => opaque_attr(symrefs(outs); context = ctx),
+            "src_offsets" => opaque_attr(i64s(src_offsets); context = ctx),
+            "dst_offsets" => opaque_attr(i64s(dst_offsets); context = ctx),
+        ],
+    )
+end
+
 # `aie.core`: the program running on a compute tile.
 function core_op(ctx, tile::IR.Value, body::IR.Region; stack_size::Integer = 1024)
     return create_op(

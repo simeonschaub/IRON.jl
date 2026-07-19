@@ -77,9 +77,11 @@ function _schedule_launch(
     num_cores = isempty(spatial) ? 1 : prod(e for (_, e) in spatial)
 
     # Per operand: infer the tile shape from the buffer and its access axes, and pin
-    # down its FIFO name and host/kernel-side types.
+    # down its FIFO name, host/kernel-side types, and (for `L2(...)`) the MemTile fan-out
+    # pattern -- explicit if given, else inferred from the access: an output joins, an
+    # input indexed by a `@cores` axis distributes, one that is not broadcasts.
     specs = map(enumerate(operands)) do (i, op)
-        dir, arr, access = op
+        dir, arr, access, l2, pattern = op
         bufdims = size(arr)
         length(access) == length(bufdims) || error(
             "IRON: operand $i has a $(length(bufdims))-D buffer but $(length(access)) access axes"
@@ -92,9 +94,23 @@ function _schedule_launch(
             )
             bufdims[d] ÷ extent[ax]
         end
+        acc = collect(Symbol, access)
+        l2pat = if !l2
+            nothing
+        else
+            inferred = dir === :out ? :join :
+                any(a -> a in core_names, acc) ? :distribute : :broadcast
+            pat = pattern === nothing ? inferred : pattern
+            # A join is the output side; broadcast/distribute are the input side.
+            (dir === :out) == (pat === :join) || error(
+                "IRON: L2 pattern `$pat` does not match a $(dir === :out ? "`Out`" : "`In`") \
+                operand (op$i); use `join` for outputs, `broadcast`/`distribute` for inputs"
+            )
+            pat
+        end
         T = eltype(arr)
         (
-            dir = dir, array = arr, access = collect(Symbol, access), name = "op$i",
+            dir = dir, array = arr, access = acc, name = "op$i", l2pattern = l2pat,
             buffer_type = Tile{T, Tuple{bufdims...}}, tile_type = Tile{T, Tuple{tdims...}},
         )
     end
@@ -120,10 +136,30 @@ function _schedule_launch(
     any(s -> s.dir === :in, specs) ||
         error("IRON: an @iron reduction needs at least one `In(...)` operand")
 
+    # L2/MemTile forwarding presupposes a core array to fan out to.
+    if any(s -> s.l2pattern !== nothing, specs) && num_cores == 1
+        error("IRON: `L2(...)` MemTile forwarding needs `@cores` (more than one core)")
+    end
+    # A broadcast operand must be shared across the cores: it cannot be indexed by a
+    # `@cores` axis (each core would then need a different tile, i.e. a distribute).
+    for s in specs
+        s.l2pattern === :broadcast && any(a -> a in core_names, s.access) && error(
+            "IRON: L2 `broadcast` operand $(s.name) is indexed by a `@cores` axis; it is not \
+            shared across the cores -- use `distribute` (or drop the explicit pattern)"
+        )
+        # Only broadcast L2 is wired up so far; distribute/join come with the per-column
+        # MemTile topology (see the whole_array port in the plan).
+        s.l2pattern in (:distribute, :join) && error(
+            "IRON: L2 `$(s.l2pattern)` is not implemented yet (operand $(s.name)); only \
+            `broadcast` L2 forwarding is available -- leave $(s.dir === :out ? "outputs" : "distributed inputs") as bare `$(s.dir === :out ? "Out" : "In")(...)` for now"
+        )
+    end
+
     key = (
         typeof(init), typeof(step),
         Tuple(s.buffer_type for s in specs), Tuple(s.tile_type for s in specs),
         Tuple(s.dir for s in specs), Tuple(Tuple(s.access) for s in specs),
+        Tuple(s.l2pattern for s in specs),
         Tuple(spatial), Tuple(temporal), Tuple(reduction), device, String(name), Tuple(flags), Int(stack_size),
     )
     compiled = get!(_LAUNCH_CACHE, key) do
@@ -241,24 +277,40 @@ function _emit_schedule_runtime!(ctx::IR.Context, specs, spatial, temporal, redu
     grid_of(s, coord) = Tuple(coord[a] for a in s.access)
     in_ops = [i for (i, s) in enumerate(specs) if s.dir === :in]
     out_ops = [i for (i, s) in enumerate(specs) if s.dir === :out]
+    # Broadcast inputs are shared across cores: the runtime feeds each tile once into the
+    # shim->memtile FIFO and the memtile fans it out on-chip. The rest are fed per core.
+    bcast_in = [i for i in in_ops if specs[i].l2pattern === :broadcast]
+    direct_in = [i for i in in_ops if specs[i].l2pattern !== :broadcast]
     core_coords = _axis_coords(spatial)   # one spatial coordinate per core
 
     for tc in _axis_coords(temporal)
-        # A sliding window of in-flight input BDs, one queue per (operand, core) FIFO. The
-        # shim runs at most `FIFO_DEPTH` tiles ahead of a core before its object FIFO
-        # backpressures, so configuring more up front buys no overlap and just burns buffer
-        # descriptors (a tile holds at most 16). Await + free the oldest before the next.
-        inflight = Dict((i, c) => IR.Value[] for i in in_ops, c in 0:(num_cores - 1))
+        # A sliding window of in-flight input BDs, one queue per FIFO -- per (operand, core)
+        # for direct inputs, per operand for the shared broadcast ones. The shim runs at
+        # most `FIFO_DEPTH` tiles ahead of a core before its object FIFO backpressures, so
+        # configuring more up front buys no overlap and just burns buffer descriptors (a
+        # tile holds at most 16). Await + free the oldest before the next.
+        inflight = Dict{Any, Vector{IR.Value}}()
+        for i in bcast_in
+            inflight[(:bcast, i)] = IR.Value[]
+        end
+        for i in direct_in, c in 0:(num_cores - 1)
+            inflight[(i, c)] = IR.Value[]
+        end
 
         # Advance the reduction in lockstep across the cores: feed *every* core its rc-th
         # input tiles before moving to rc+1. The window's await then paces all cores
         # together, so they compute concurrently -- feeding one core's whole reduction
         # first would gate the next core on this core's progress and serialise them.
         for rc in _axis_coords(reduction)
+            for i in bcast_in                                  # shared: one tile for all cores
+                q = inflight[(:bcast, i)]
+                length(q) >= FIFO_DEPTH && retire(popfirst!(q))
+                push!(q, task(i, "op$(i)_l3l2", grid_of(specs[i], merge(tc, rc)); token = true))
+            end
             for (c, sc) in enumerate(core_coords)
                 cidx = c - 1
                 full = merge(merge(sc, tc), rc)
-                for i in in_ops
+                for i in direct_in
                     q = inflight[(i, cidx)]
                     length(q) >= FIFO_DEPTH && retire(popfirst!(q))
                     push!(q, task(i, _fifo_name(i, cidx, num_cores), grid_of(specs[i], full); token = true))
@@ -277,7 +329,10 @@ function _emit_schedule_runtime!(ctx::IR.Context, specs, spatial, temporal, redu
         for o in outs
             push!(body, dma_await_task_op(ctx, o))
         end
-        for c in 0:(num_cores - 1), i in in_ops, t in inflight[(i, c)]
+        for i in bcast_in, t in inflight[(:bcast, i)]
+            retire(t)
+        end
+        for c in 0:(num_cores - 1), i in direct_in, t in inflight[(i, c)]
             retire(t)
         end
     end
@@ -318,19 +373,45 @@ function _build_schedule_program(
         end
         push!(device_body, core_op(ctx, core_tile, _emit_schedule_core!(ctx, init, step, specs, num_temporal, num_reduce); stack_size))
     else
-        # Multi-core: one shim tile *per core*, hosting that core's operand FIFOs. So the
-        # shim count is the core count (bounded by the device's shim columns), and each
-        # shim needs only one DMA channel per operand -- not one channel per core, which a
-        # single shared shim tile could not supply. Each core runs the same program over
-        # its temporal slice, reading/writing its own FIFOs.
+        # Multi-core. Create every compute tile first so a broadcast FIFO can list them all
+        # as consumers.
+        core_tiles = IR.Value[]
+        for _ in 0:(num_cores - 1)
+            t = logical_tile_op(ctx, CoreTile)
+            push!(device_body, t)
+            push!(core_tiles, IR.result(t, 1))
+        end
+
+        # L2 broadcast operands: DDR -> shim -> MemTile -> (broadcast) every core, via a
+        # linked pair of FIFOs sharing the memtile. One shim + memtile + link per broadcast
+        # operand (vs re-reading it from DDR on each core's own shim). Every core reads the
+        # shared `l2l1` FIFO.
+        bcast_fifo = Dict{Int, String}()
+        for (i, s) in enumerate(specs)
+            s.l2pattern === :broadcast || continue
+            mem = logical_tile_op(ctx, MemTile)
+            push!(device_body, mem)
+            shim = logical_tile_op(ctx, ShimNOCTile)
+            push!(device_body, shim)
+            l3l2, l2l1 = "op$(i)_l3l2", "op$(i)_l2l1"
+            oftype = objectfifo_type(ctx, s.tile_type)
+            push!(device_body, objectfifo_op(ctx, l3l2, IR.result(shim, 1), IR.Value[IR.result(mem, 1)], oftype, FIFO_DEPTH))
+            push!(device_body, objectfifo_op(ctx, l2l1, IR.result(mem, 1), core_tiles, oftype, FIFO_DEPTH))
+            push!(device_body, objectfifo_link_op(ctx, [l3l2], [l2l1]))
+            bcast_fifo[i] = l2l1
+        end
+
+        # Per core: its own shim tile hosting the direct (non-L2) operand FIFOs. So the shim
+        # count is the core count (+ one per broadcast operand), bounded by the device's
+        # shim columns, and each shim needs only one DMA channel per operand. Broadcast
+        # operands are read from their shared `l2l1` FIFO instead.
         for c in 0:(num_cores - 1)
-            core = logical_tile_op(ctx, CoreTile)
-            push!(device_body, core)
-            core_tile = IR.result(core, 1)
+            core_tile = core_tiles[c + 1]
             shim = logical_tile_op(ctx, ShimNOCTile)
             push!(device_body, shim)
             shim_tile = IR.result(shim, 1)
             core_specs = map(enumerate(specs)) do (i, s)
+                haskey(bcast_fifo, i) && return merge(s, (; name = bcast_fifo[i]))
                 fname = _fifo_name(i, c, num_cores)
                 producer_tile, consumer_tile = s.dir === :in ? (shim_tile, core_tile) : (core_tile, shim_tile)
                 push!(device_body, objectfifo_op(ctx, fname, producer_tile, IR.Value[consumer_tile], objectfifo_type(ctx, s.tile_type), FIFO_DEPTH))
@@ -385,18 +466,46 @@ function _parse_for_axes(header, what)
     return axes
 end
 
-# One step-call operand: `In(a)[mi, kk]` / `Out(c)[mi, nj]` -> (dir, arr, [axes...]).
+# One step-call operand: `In(a)[mi, kk]` / `Out(c)[mi, nj]` -> (dir, arr, [axes...], l2,
+# pattern). An operand may be wrapped in `L2(...)` to route it through a MemTile; the
+# fan-out pattern (broadcast/distribute/join) is inferred from the access axes unless
+# stated explicitly, as `L2(In(a); broadcast)` or `L2(In(a), broadcast)`.
+const _L2_PATTERNS = (:broadcast, :distribute, :join)
+
 function _parse_operand(op)
     Meta.isexpr(op, :ref) || error(
-        "@iron: each step argument must be `In(a)[axes...]` or `Out(a)[axes...]`, got `$op`"
+        "@iron: each step argument must be `In(a)[axes...]`, `Out(a)[axes...]` or `L2(...)[axes...]`, got `$op`"
     )
     callee, access = op.args[1], op.args[2:end]
+
+    # Peel an optional `L2(...)` wrapper, collecting an explicit pattern if given.
+    l2, pattern = false, nothing
+    if Meta.isexpr(callee, :call) && callee.args[1] === :L2
+        l2 = true
+        for a in callee.args[2:end]
+            if Meta.isexpr(a, :parameters)                 # `L2(In(a); broadcast)`
+                for p in a.args
+                    p in _L2_PATTERNS || error(
+                        "@iron: `L2(...)` pattern must be `broadcast`, `distribute` or `join`, got `$p`"
+                    )
+                    pattern = p
+                end
+            elseif a in _L2_PATTERNS                        # `L2(In(a), broadcast)`
+                pattern = a
+            elseif Meta.isexpr(a, :call) && a.args[1] in (:In, :Out)
+                callee = a
+            else
+                error("@iron: `L2(...)` wraps one `In(a)`/`Out(a)` (optionally with a pattern), got `$op`")
+            end
+        end
+    end
+
     (Meta.isexpr(callee, :call) && length(callee.args) == 2 && callee.args[1] in (:In, :Out)) ||
         error("@iron: a step argument must wrap the buffer in `In(...)` or `Out(...)`, got `$op`")
     all(a -> a isa Symbol, access) ||
         error("@iron: the `[...]` of a step argument must be axis names, got `$op`")
     dir = callee.args[1] === :In ? :in : :out
-    return (dir, callee.args[2], Symbol[access...])
+    return (dir, callee.args[2], Symbol[access...], l2, pattern)
 end
 
 # The single step call inside a `@reduce for ... end` (or the space body, no reduction)
@@ -473,8 +582,9 @@ function _build_iron_schedule(forexpr, kws)
     end
 
     ops_expr = Expr(:tuple, [
-        Expr(:tuple, QuoteNode(dir), esc(arr), Expr(:tuple, QuoteNode.(access)...))
-        for (dir, arr, access) in operands
+        Expr(:tuple, QuoteNode(dir), esc(arr), Expr(:tuple, QuoteNode.(access)...),
+             l2, pattern === nothing ? :nothing : QuoteNode(pattern))
+        for (dir, arr, access, l2, pattern) in operands
     ]...)
 
     # `@cores` becomes a `cores = (:axis, ...)` keyword on the launch call, alongside the
