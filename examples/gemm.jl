@@ -1,12 +1,13 @@
-# A tiled single-core GEMM, C = A * B, with the micro-kernels written in Julia and the
+# A tiled multi-core GEMM, C = A * B, with the micro-kernels written in Julia and the
 # schedule expressed with `@iron`'s `for` form.
 #
-# This is the minimal tiled *reduction*: (m, k) x (k, n) tiles stream through object
-# FIFOs and reduce on one core into an (m, n) output tile. The `@iron for` loop nest
-# spells out the schedule -- the outer loop is the output-tile iteration and the nested
-# `@reduce for` is the accumulation -- and IRON wires up the FIFOs, worker and host DMA:
+# This is the tiled *reduction*: (m, k) x (k, n) tiles stream through object FIFOs and
+# reduce into an (m, n) output tile. The `@iron for` loop nest spells out the schedule --
+# the outer loop is the output-tile iteration, `@cores nj` spreads that axis across the
+# compute-core array, and the nested `@reduce for` is the accumulation -- and IRON wires
+# up the cores, FIFOs and host DMA:
 #
-#     for each (mi, nj) output tile:      # the space loop
+#     for each (mi, nj) output tile:      # the space loop  (nj -> core array)
 #         gemm_zero!(C)                    # @init
 #         for each kk reduction tile:      # the @reduce loop
 #             gemm_acc!(A, B, C)           # C += A * B
@@ -72,10 +73,13 @@ if get(ENV, "IRON_RUN", "0") == "1"
     da, db = NPUArray(a), NPUArray(b)
     dc = NPUArray{Tacc}(undef, Tile{Tacc, Tuple{M, N}})
 
-    # C = A * B, in (m, k) x (k, n) tiles reduced on one core. Tile shapes are inferred
-    # from each buffer and the extents of the axes indexing it (e.g. da is M x K indexed
-    # by (mi, kk) of extent (M/m, K/k), giving an m x k tile).
+    # C = A * B, in (m, k) x (k, n) tiles. `@cores nj` spreads the output columns across
+    # the compute-core array -- here N/n = 4 cores, each reducing its own column of
+    # output tiles concurrently. Tile shapes are inferred from each buffer and the extents
+    # of the axes indexing it (e.g. da is M x K indexed by (mi, kk) of extent (M/m, K/k),
+    # giving an m x k tile).
     @iron stack_size = 3328 flags = AIECC_FLAGS for mi in 1:div(M, m), nj in 1:div(N, n)
+        @cores nj
         @init gemm_zero!(dc)
         @reduce for kk in 1:div(K, k)
             gemm_acc!(In(da)[mi, kk], In(db)[kk, nj], Out(dc)[mi, nj])
@@ -85,7 +89,7 @@ if get(ENV, "IRON_RUN", "0") == "1"
     result = Array(dc)
     expected = Tacc.(Float32.(a) * Float32.(b))
     if result == expected
-        println("NPU gemm ($(M)x$(K)x$(N), tiles $(m)x$(k)x$(n)) matches")
+        println("NPU gemm ($(M)x$(K)x$(N), tiles $(m)x$(k)x$(n), $(div(N, n)) cores) matches")
     else
         println("MISMATCH in $(count(result .!= expected)) of $(length(expected))")
     end
