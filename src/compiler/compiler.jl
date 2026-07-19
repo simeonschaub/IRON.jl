@@ -8,6 +8,7 @@ function mlir_type(ctx::IR.Context, T)
     T === Int && return IR.IndexType(; context = ctx)
     T <: Tile && return memref_type(ctx, T)
     T <: Vec && return vector_type(ctx, T)
+    T <: Mat && return matrix_type(ctx, T)
     return mlir_eltype(ctx, T)
 end
 
@@ -19,6 +20,17 @@ The `vector<NxT>` a `SIMD.Vec` lowers to.
 function vector_type(ctx::IR.Context, ::Type{Vec{N, T}}) where {N, T}
     return IR.Type(
         API.mlirVectorTypeGet(1, Int64[N], mlir_eltype(ctx, T))
+    )
+end
+
+"""
+    matrix_type(ctx, ::Type{Mat{R,C,T}}) -> IR.Type
+
+The rank-2 `vector<RxCxT>` a [`Mat`](@ref) lowers to.
+"""
+function matrix_type(ctx::IR.Context, ::Type{Mat{R, C, T}}) where {R, C, T}
+    return IR.Type(
+        API.mlirVectorTypeGet(2, Int64[R, C], mlir_eltype(ctx, T))
     )
 end
 
@@ -277,6 +289,20 @@ function emit_vector!(kc::KernelContext, block::IR.Block, jblock, inst, fn, ops,
         return nothing
     end
 
+    if fn === vmatmul
+        # The shaped hardware matmul. We emit `aievec.matmul_aie2p` (AIE2P/npu2) directly --
+        # AIEVecToLLVM lowers it to the MAC-array intrinsic. The bf16 operands stay bf16 and
+        # the f32 accumulator is the result type.
+        a, b, c = (lookup!(kc, block, o) for o in ops)
+        op = create_op(
+            "aievec.matmul_aie2p", loc(ctx);
+            operands = IR.Value[a, b, c], results = [result()],
+        )
+        push!(block, op)
+        kc.values[ssa] = IR.result(op, 1)
+        return nothing
+    end
+
     float_op, int_op = VECTOR_OPS[fn]
     builder = eltype(inst[:type]) <: AbstractFloat ? float_op : int_op
     args = IR.Value[lookup!(kc, block, o) for o in ops]
@@ -328,7 +354,7 @@ function emit_call!(kc::KernelContext, block::IR.Block, jblock, inst)
         return emit_convert!(kc, block, ssa, source, from, inst[:type])
     end
 
-    if fn in (vload, vstore!, vbroadcast, vreduce_add, vfma, vconvert, vreinterpret, vexp) ||
+    if fn in (vload, vstore!, vbroadcast, vreduce_add, vfma, vmatmul, vconvert, vreinterpret, vexp) ||
             haskey(VECTOR_OPS, fn)
         return emit_vector!(kc, block, jblock, inst, fn, ops, ssa)
     end
