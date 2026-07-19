@@ -92,11 +92,9 @@ function gemm_launch_l2!(da, db, dc, M, K, N, m, k, n)
     return nothing
 end
 
-# The current scheme uses one shim tile per core, so it fits within the device's shim
-# columns (about 8 on npu2). Scaling past that needs L2 forwarding.
+# The non-L2 scheme uses one shim tile per core, so it fits within the device's shim
+# columns (about 8 on npu2). L2 partitions the cores into groups of 4, one memtile each.
 const MAX_CORES = 8
-# distribute/join fan a single memtile out to one FIFO per core, capped by its DMA channels.
-const MAX_L2_CORES = 5
 
 # --- one size ----------------------------------------------------------------
 
@@ -186,16 +184,16 @@ if get(ENV, "IRON_RUN", "0") == "1"
         end
     end
 
-    # Does routing operands through MemTiles (`L2(...)`) actually help? Isolate its effect at
-    # a fixed 4 cores (within the distribute/join cap) on a *tall* GEMM (N = 64 -> 4 columns,
-    # large M·K) where A dominates data movement: L2 broadcasts A once instead of re-reading
-    # it per core, so a win here says L2 is the lever on this DMA-bound design.
+    # Does routing operands through MemTiles (`L2(...)`) actually help, and does it scale?
+    # Isolate its effect on *tall* GEMMs (large M·K, small N) where A dominates data movement:
+    # L2 broadcasts A once instead of re-reading it per core. N = 64 -> 4 cores (one memtile
+    # group), N = 128 -> 8 cores (two groups), so this also exercises the multi-group path.
     println()
     @printf("%-14s  %5s  %6s  %12s  %12s  %8s\n",
-            "M=K (N=64)", "ok", "cores", "no-L2 GF/s", "L2 GF/s", "L2 gain")
+            "M=K x N", "ok", "cores", "no-L2 GF/s", "L2 GF/s", "L2 gain")
     println("-"^66)
-    for s in [128, 256, 512]
-        M = K = s; N = 64; m, k, n = 16, 32, 16          # N/n = 4 cores, within MAX_L2_CORES
+    for (s, N) in [(256, 64), (512, 64), (256, 128), (512, 128)]
+        M = K = s; m, k, n = 16, 32, 16                  # N/n cores (4 or 8)
         try
             a = BFloat16[(i + j) % 7 for i in 1:M, j in 1:K]
             b = BFloat16[(i - 2j) % 5 for i in 1:K, j in 1:N]
@@ -205,10 +203,10 @@ if get(ENV, "IRON_RUN", "0") == "1"
             l2 = time_launch(gemm_launch_l2!, da, db, dc, a, b, M, K, N, m, k, n; trials = 20)
             ok = nol2.ok && l2.ok
             @printf("%-14s  %5s  %6d  %12.2f  %12.2f  %7.2fx\n",
-                    "$(M)x$(K)", ok ? "yes" : "NO", div(N, n),
+                    "$(M)x$(K)x$(N)", ok ? "yes" : "NO", div(N, n),
                     nol2.gflops, l2.gflops, l2.gflops / nol2.gflops)
         catch e
-            @printf("%-14s  %5s  %s\n", "$(M)x$(K)", "ERR", sprint(showerror, e))
+            @printf("%-14s  %5s  %s\n", "$(M)x$(K)x$(N)", "ERR", sprint(showerror, e))
         end
     end
 
