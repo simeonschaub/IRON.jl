@@ -154,15 +154,15 @@ function _schedule_launch(
             distribute/join over a 2D core grid is not implemented yet"
         )
     end
-    # Each broadcast operand takes one memtile, each distribute/join one per core group;
-    # npu2 has 8 memtile columns.
+    # All distribute/join FIFOs of a core group share that group's memtile, and each
+    # broadcast operand takes one more; npu2 has 8 memtile columns.
     if any(s -> s.l2pattern !== nothing, specs)
         ngroups = length(_core_groups(num_cores))
-        nmem = count(s -> s.l2pattern === :broadcast, specs) +
-               ngroups * count(s -> s.l2pattern in (:distribute, :join), specs)
+        has_dj = any(s -> s.l2pattern in (:distribute, :join), specs)
+        nmem = count(s -> s.l2pattern === :broadcast, specs) + (has_dj ? ngroups : 0)
         nmem <= 8 || error(
-            "IRON: this L2 design needs $nmem MemTiles but npu2 has 8; use fewer cores or \
-            fewer L2 operands until distribute+join share a memtile per column"
+            "IRON: this L2 design needs $nmem MemTiles but npu2 has 8; use fewer cores, or \
+            fold the broadcast operand onto a group memtile (not implemented yet)"
         )
     end
 
@@ -467,39 +467,25 @@ function _build_schedule_program(
         # memtile (`aie.objectfifo.link`), so the operand crosses DDR once and fans out/in
         # on-chip instead of using a shim channel per core:
         #   broadcast  -- shared input: one memtile, l3l2 -> l2l1 with every core a consumer;
-        #   distribute -- per-core input: per group of cores a memtile, l3l2 (super-tile) ->
-        #                 one l2l1 per core, dst_offsets slicing each core's tile out;
-        #   join       -- per-core output: per group a memtile, one l1l2 per core -> l2l3
-        #                 (super-tile), src_offsets. Grouping keeps within a memtile's DMA
-        #                 channels and maps onto the npu2 columns.
+        #   distribute -- per-core input: l3l2 (a group's super-tile) -> one l2l1 per core,
+        #                 dst_offsets slicing each core's tile out;
+        #   join       -- per-core output: one l1l2 per core -> l2l3 (super-tile), src_offsets.
+        # All the distribute/join FIFOs for a group of cores share that group's ONE memtile
+        # (as whole_array's per-column memtile does), so the memtile count is the group count,
+        # not the operand count -- which is what lets 32 cores fit in 8 memtile columns.
         groups = _core_groups(num_cores)
-        for (i, s) in enumerate(specs)
-            s.l2pattern === nothing && continue
-            tile_of = objectfifo_type(ctx, s.tile_type)
-
-            if s.l2pattern === :broadcast
-                mem = logical_tile_op(ctx, MemTile); push!(device_body, mem)
-                shim = logical_tile_op(ctx, ShimNOCTile); push!(device_body, shim)
-                l3l2, l2l1 = "op$(i)_l3l2", "op$(i)_l2l1"
-                push!(device_body, objectfifo_op(ctx, l3l2, IR.result(shim, 1), IR.Value[IR.result(mem, 1)], tile_of, FIFO_DEPTH))
-                push!(device_body, objectfifo_op(ctx, l2l1, IR.result(mem, 1), core_tiles, tile_of, FIFO_DEPTH))
-                push!(device_body, objectfifo_link_op(ctx, [l3l2], [l2l1]))
-                for c in 1:num_cores
-                    corefifo[c][i] = l2l1
-                end
-                continue
-            end
-
-            # distribute/join: one memtile + shim per group of cores.
-            for (gidx, group) in enumerate(groups)
-                gsize = length(group)
-                base = Dict(a => (gidx - 1) * L2_GROUP for a in core_names)
+        djspecs = [(i, s) for (i, s) in enumerate(specs) if s.l2pattern in (:distribute, :join)]
+        for (gidx, group) in enumerate(groups)
+            isempty(djspecs) && break
+            gsize = length(group)
+            base = Dict(a => (gidx - 1) * L2_GROUP for a in core_names)
+            mem = logical_tile_op(ctx, MemTile); push!(device_body, mem)
+            shim = logical_tile_op(ctx, ShimNOCTile); push!(device_body, shim)
+            mem_tile, shim_tile = IR.result(mem, 1), IR.result(shim, 1)
+            for (i, s) in djspecs
+                tile_of = objectfifo_type(ctx, s.tile_type)
                 super_of = objectfifo_type(ctx, _retile(s.tile_type, _super_dims(s, core_names, gsize)))
                 offs = [_sub_offset(s, core_coords[c + 1], core_names, gsize, base) for c in group]
-                mem = logical_tile_op(ctx, MemTile); push!(device_body, mem)
-                shim = logical_tile_op(ctx, ShimNOCTile); push!(device_body, shim)
-                mem_tile, shim_tile = IR.result(mem, 1), IR.result(shim, 1)
-
                 if s.l2pattern === :distribute
                     l3l2 = "op$(i)_l3l2_g$(gidx - 1)"
                     push!(device_body, objectfifo_op(ctx, l3l2, shim_tile, IR.Value[mem_tile], super_of, FIFO_DEPTH))
@@ -523,6 +509,21 @@ function _build_schedule_program(
                     end
                     push!(device_body, objectfifo_link_op(ctx, ins, [l2l3]; src_offsets = offs))
                 end
+            end
+        end
+
+        # Broadcast operands: one memtile each, multicast to every core.
+        for (i, s) in enumerate(specs)
+            s.l2pattern === :broadcast || continue
+            tile_of = objectfifo_type(ctx, s.tile_type)
+            mem = logical_tile_op(ctx, MemTile); push!(device_body, mem)
+            shim = logical_tile_op(ctx, ShimNOCTile); push!(device_body, shim)
+            l3l2, l2l1 = "op$(i)_l3l2", "op$(i)_l2l1"
+            push!(device_body, objectfifo_op(ctx, l3l2, IR.result(shim, 1), IR.Value[IR.result(mem, 1)], tile_of, FIFO_DEPTH))
+            push!(device_body, objectfifo_op(ctx, l2l1, IR.result(mem, 1), core_tiles, tile_of, FIFO_DEPTH))
+            push!(device_body, objectfifo_link_op(ctx, [l3l2], [l2l1]))
+            for c in 1:num_cores
+                corefifo[c][i] = l2l1
             end
         end
 
