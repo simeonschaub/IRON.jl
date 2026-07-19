@@ -154,15 +154,17 @@ function _schedule_launch(
             distribute/join over a 2D core grid is not implemented yet"
         )
     end
-    # All distribute/join FIFOs of a core group share that group's memtile, and each
-    # broadcast operand takes one more; npu2 has 8 memtile columns.
+    # Each core group shares one memtile; broadcast operands take their own while columns are
+    # free and otherwise fold onto a group memtile. So the design fits in npu2's 8 memtile
+    # columns as long as the groups do (or, with no groups, the broadcasts do).
     if any(s -> s.l2pattern !== nothing, specs)
         ngroups = length(_core_groups(num_cores))
         has_dj = any(s -> s.l2pattern in (:distribute, :join), specs)
-        nmem = count(s -> s.l2pattern === :broadcast, specs) + (has_dj ? ngroups : 0)
+        nbcast = count(s -> s.l2pattern === :broadcast, specs)
+        nmem = has_dj ? ngroups + min(nbcast, max(0, 8 - ngroups)) : nbcast
         nmem <= 8 || error(
-            "IRON: this L2 design needs $nmem MemTiles but npu2 has 8; use fewer cores, or \
-            fold the broadcast operand onto a group memtile (not implemented yet)"
+            "IRON: this L2 design needs more than npu2's 8 memtile columns \
+            ($(has_dj ? "$ngroups core groups" : "$nbcast broadcast operands")); use fewer cores"
         )
     end
 
@@ -475,6 +477,7 @@ function _build_schedule_program(
         # not the operand count -- which is what lets 32 cores fit in 8 memtile columns.
         groups = _core_groups(num_cores)
         djspecs = [(i, s) for (i, s) in enumerate(specs) if s.l2pattern in (:distribute, :join)]
+        group_mems = IR.Value[]
         for (gidx, group) in enumerate(groups)
             isempty(djspecs) && break
             gsize = length(group)
@@ -482,6 +485,7 @@ function _build_schedule_program(
             mem = logical_tile_op(ctx, MemTile); push!(device_body, mem)
             shim = logical_tile_op(ctx, ShimNOCTile); push!(device_body, shim)
             mem_tile, shim_tile = IR.result(mem, 1), IR.result(shim, 1)
+            push!(group_mems, mem_tile)
             for (i, s) in djspecs
                 tile_of = objectfifo_type(ctx, s.tile_type)
                 super_of = objectfifo_type(ctx, _retile(s.tile_type, _super_dims(s, core_names, gsize)))
@@ -512,15 +516,24 @@ function _build_schedule_program(
             end
         end
 
-        # Broadcast operands: one memtile each, multicast to every core.
+        # Broadcast operands multicast to every core (only 1 in + 1 out on the memtile, so
+        # cheap). Give each its own memtile while columns are free; once the groups use all 8
+        # columns (the 32-core case), fold the broadcast onto a group memtile round-robin.
+        bcast_i = 0
         for (i, s) in enumerate(specs)
             s.l2pattern === :broadcast || continue
             tile_of = objectfifo_type(ctx, s.tile_type)
-            mem = logical_tile_op(ctx, MemTile); push!(device_body, mem)
             shim = logical_tile_op(ctx, ShimNOCTile); push!(device_body, shim)
+            mem_tile = if length(group_mems) + bcast_i < 8
+                mem = logical_tile_op(ctx, MemTile); push!(device_body, mem)
+                IR.result(mem, 1)
+            else
+                group_mems[(bcast_i % length(group_mems)) + 1]
+            end
+            bcast_i += 1
             l3l2, l2l1 = "op$(i)_l3l2", "op$(i)_l2l1"
-            push!(device_body, objectfifo_op(ctx, l3l2, IR.result(shim, 1), IR.Value[IR.result(mem, 1)], tile_of, FIFO_DEPTH))
-            push!(device_body, objectfifo_op(ctx, l2l1, IR.result(mem, 1), core_tiles, tile_of, FIFO_DEPTH))
+            push!(device_body, objectfifo_op(ctx, l3l2, IR.result(shim, 1), IR.Value[mem_tile], tile_of, FIFO_DEPTH))
+            push!(device_body, objectfifo_op(ctx, l2l1, mem_tile, core_tiles, tile_of, FIFO_DEPTH))
             push!(device_body, objectfifo_link_op(ctx, [l3l2], [l2l1]))
             for c in 1:num_cores
                 corefifo[c][i] = l2l1
