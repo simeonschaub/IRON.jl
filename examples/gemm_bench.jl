@@ -193,8 +193,12 @@ if get(ENV, "IRON_RUN", "0") == "1"
     @printf("%-14s  %5s  %6s  %12s  %12s  %8s\n",
             "M=K x N", "ok", "cores", "no-L2 GF/s", "L2 GF/s", "L2 gain")
     println("-"^66)
-    for (s, N) in [(512, 64), (512, 128), (256, 256)]
-        M = K = s; m, k, n = 16, 32, 16                  # N/n cores (4, 8, 16)
+    # Default keeps the run short; IRON_BENCH_FULL=1 adds the 16- and 32-core designs, whose
+    # large MLIR is slow to compile.
+    tall = [(512, 64), (512, 128)]
+    get(ENV, "IRON_BENCH_FULL", "0") == "1" && append!(tall, [(256, 256), (512, 512)])
+    for (s, N) in tall
+        M = K = s; m, k, n = 16, 32, 16                  # N/n cores (4, 8, 16, 32)
         ncores = div(N, n)
         try
             a = BFloat16[(i + j) % 7 for i in 1:M, j in 1:K]
