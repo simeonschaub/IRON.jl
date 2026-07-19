@@ -1,17 +1,15 @@
-# A schedule DSL for tiled *reductions* -- the shape `@iron` cannot infer. A GEMM is
-# the archetype: an output tile is held across an inner loop that streams the input
-# operands and accumulates into it, and each operand's tile is addressed by a
-# different mix of the loop variables. That schedule is not visible in the kernels,
-# so it is declared here:
+# The tiled-*reduction* schedule behind `@iron`'s `for` form -- the shape `@iron`'s
+# call form cannot infer. A GEMM is the archetype: an output tile is held across an
+# inner loop that streams the input operands and accumulates into it, and each
+# operand's tile is addressed by a different mix of the loop variables. That schedule
+# is not visible in the kernels, so it is written as a `for` loop -- the header is the
+# output-tile iteration (the space axes) and the body declares the operands and the
+# reduction:
 #
-#     @iron_schedule begin
-#         space  = (mi = M÷m, nj = N÷n)   # the output-tile iteration
-#         reduce = (kk = K÷k,)            # the accumulation axis
-#         init   = gemm_zero!             # run on the accumulator once per output tile
-#         step   = gemm_acc!              # run each reduction step (C += A*B)
-#         In(A)  => (mi, kk)              # each operand: direction and the axes that
-#         In(B)  => (kk, nj)              # index its tile, in buffer-dimension order
-#         Out(C) => (mi, nj)             # (the Out operand is the accumulator)
+#     @iron stack_size = 3328 for mi in 1:M÷m, nj in 1:N÷n
+#         @init gemm_zero!(C)                               # run on the accumulator once per output tile
+#         gemm_acc!(In(A)[mi, kk], In(B)[kk, nj], Out(C)[mi, nj])  # the step (C += A*B); each operand's
+#         @reduce kk = K÷k                                  #   [axes] index its tile in buffer order
 #     end
 #
 # This generalises the hand-written generator in `gemm.jl`: the core loop nest is the
@@ -22,7 +20,7 @@
 # shape and the extents of the axes indexing it: buffer dimension `d` of extent `D`,
 # indexed by an axis of extent `E`, gives a tile extent `D ÷ E`.
 
-# The launch behind `@iron_schedule`. `space`/`reduction` are tuples of `(name, extent)`;
+# The launch behind the `for` form. `space`/`reduction` are tuples of `(name, extent)`;
 # `operands` is a tuple of `(direction, NPUArray, access)` where `access` is the tuple of
 # axis names indexing that buffer, one per dimension.
 function _schedule_launch(
@@ -73,9 +71,9 @@ function _schedule_launch(
         )
     end
     any(s -> s.dir === :out, specs) ||
-        error("IRON: @iron_schedule needs at least one `Out(...)` operand (the accumulator)")
+        error("IRON: an @iron reduction needs at least one `Out(...)` operand (the accumulator)")
     any(s -> s.dir === :in, specs) ||
-        error("IRON: @iron_schedule needs at least one `In(...)` operand")
+        error("IRON: an @iron reduction needs at least one `In(...)` operand")
 
     key = (
         typeof(init), typeof(step),
@@ -127,7 +125,8 @@ function _emit_schedule_core!(ctx::IR.Context, @nospecialize(init), @nospecializ
         push!(outer, acc)
         push!(out_vals, IR.result(acc, 1))
     end
-    compile_kernel!(ctx, outer, init, output_types, out_vals)
+    # `@init` is optional: with none, the output tile enters the reduction as-is.
+    init === nothing || compile_kernel!(ctx, outer, init, output_types, out_vals)
 
     # Inner (reduce) loop: acquire the inputs and accumulate into the held outputs.
     inner = IR.Block([index], [loc(ctx)])
@@ -243,125 +242,97 @@ function _build_schedule_program(
     mod = IR.Module(loc(ctx))
     push!(IR.body(mod), device_op(ctx, device, name, region(device_body)))
     IR.verify(IR.Operation(mod)) ||
-        error("IRON: @iron_schedule generated an invalid MLIR module (see the diagnostics above)")
+        error("IRON: the @iron reduction generated an invalid MLIR module (see the diagnostics above)")
     canonicalize!(mod, ctx)
     return string(IR.Operation(mod))
 end
 
-# --- macro front end ---------------------------------------------------------
+# --- `@iron for` front end ---------------------------------------------------
+# Turns the `for` form of `@iron` (parsed in `launch.jl`) into a `_schedule_launch`
+# call. The `for` header gives the space axes, the body a step call plus optional
+# `@init`/`@reduce` lines.
 
-# `(mi = M÷m, nj = N÷n)` or a single `(kk = K÷k)` -> [(:mi, :(M÷m)), ...].
-function _parse_axes(rhs)
+# `[(:name, extent_expr), ...]` for the space or reduction axes.
+_axes_to_expr(axes) = Expr(:tuple, [Expr(:tuple, QuoteNode(nm), esc(ex)) for (nm, ex) in axes]...)
+
+# The `for` header: `for mi in 1:M÷m, nj in 1:N÷n` -> [(:mi, :(length(1:M÷m))), ...].
+# One spec is a bare `=`; several are a `:block` of them. Each axis extent is the
+# length of its range, evaluated at launch.
+function _parse_for_axes(header)
+    specs = Meta.isexpr(header, :block) ? header.args : Any[header]
     axes = Tuple{Symbol, Any}[]
-    entries = Meta.isexpr(rhs, :tuple) ? rhs.args : Any[rhs]
-    for e in entries
-        (Meta.isexpr(e, :(=)) && e.args[1] isa Symbol) ||
-            error("@iron_schedule: an axis must be written `name = extent`, got `$e`")
-        push!(axes, (e.args[1], e.args[2]))
+    for s in specs
+        s isa LineNumberNode && continue
+        (Meta.isexpr(s, :(=)) && s.args[1] isa Symbol) ||
+            error("@iron: a space axis must be written `var in range`, got `$s`")
+        push!(axes, (s.args[1], Expr(:call, :length, s.args[2])))
     end
+    isempty(axes) && error("@iron: the `for` needs at least one space axis")
     return axes
 end
 
-# `(mi, kk)` or a single `mi` -> [:mi, :kk].
-function _parse_access(a)
-    a isa Symbol && return Symbol[a]
-    (Meta.isexpr(a, :tuple) && all(x -> x isa Symbol, a.args)) ||
-        error("@iron_schedule: an access must be `(axis, ...)` of axis names, got `$a`")
-    return Symbol[a.args...]
-end
-
-_axes_to_expr(axes) = Expr(:tuple, [Expr(:tuple, QuoteNode(nm), esc(ex)) for (nm, ex) in axes]...)
-
-"""
-    @iron_schedule begin
-        space  = (mi = M÷m, nj = N÷n)
-        reduce = (kk = K÷k,)
-        init   = zero_kernel
-        step   = acc_kernel
-        In(A)  => (mi, kk)
-        In(B)  => (kk, nj)
-        Out(C) => (mi, nj)
+# A `@reduce` clause: `kk = K÷k` (extent directly) or `kk in 1:K÷k` (extent = length).
+# A tuple declares several at once.
+function _reduce_clauses(ex)
+    entries = Meta.isexpr(ex, :tuple) ? ex.args : Any[ex]
+    clauses = Tuple{Symbol, Any}[]
+    for e in entries
+        if Meta.isexpr(e, :(=)) && e.args[1] isa Symbol
+            push!(clauses, (e.args[1], e.args[2]))
+        elseif Meta.isexpr(e, :call) && length(e.args) == 3 && e.args[1] === :in && e.args[2] isa Symbol
+            push!(clauses, (e.args[2], Expr(:call, :length, e.args[3])))
+        else
+            error("@iron: a `@reduce` clause must be `axis = extent` or `axis in range`, got `$e`")
+        end
     end
-
-Compile and run a tiled **reduction** on the NPU -- the schedule `@iron` cannot infer.
-The design accumulates an output tile across an inner loop that streams the input
-operands and reduces into it, GEMM being the archetype.
-
-The block declares:
-
-  * `space` -- the output-tile iteration axes as `name = extent` (the outer loop nest).
-  * `reduce` -- the accumulation axes (the inner loop nest); omit for none.
-  * `init` -- a kernel run on the output/accumulator tiles once per output tile, taking
-    the `Out` operands in declaration order (e.g. `zero_kernel(c)`).
-  * `step` -- a kernel run each reduction step, taking **all** operands in declaration
-    order (e.g. `acc_kernel(a, b, c)`), accumulating into the outputs.
-  * one line per operand, `In(a) => (axes...)` or `Out(a) => (axes...)`, giving the
-    direction and the axes indexing that buffer, one per dimension. Each `a` is an
-    [`NPUArray`](@ref); the tile shape is inferred as `buffer_dim ÷ axis_extent` per
-    dimension, so the axis extents must divide the buffer. An `Out` operand is the
-    accumulator and may be indexed by space axes only.
-
-Options may be added as block settings: `device`, `name`, `flags`, `verbose`,
-`stack_size` (reductions often need a larger core stack than the 1024-byte default).
-
-The compiled design is cached like [`@iron`](@ref). Results land in the `Out`
-buffers, ready via `Array`. Returns the [`CompiledProgram`](@ref).
-
-```julia
-# C = A * B, in (m, k) x (k, n) tiles reduced on one core.
-@iron_schedule begin
-    space  = (mi = M÷m, nj = N÷n)
-    reduce = (kk = K÷k,)
-    init   = gemm_zero!
-    step   = gemm_acc!
-    stack_size = 3328
-    flags  = ["--alloc-scheme=basic-sequential"]
-    In(A)  => (mi, kk)
-    In(B)  => (kk, nj)
-    Out(C) => (mi, nj)
+    return clauses
 end
-```
-"""
-macro iron_schedule(block)
-    Meta.isexpr(block, :block) ||
-        error("@iron_schedule: expected a `begin ... end` block")
 
-    space = reduction = init = step = nothing
-    operands = Tuple{Symbol, Any, Vector{Symbol}}[]
-    options = Expr[]
+# One step-call operand: `In(a)[mi, kk]` / `Out(c)[mi, nj]` -> (dir, arr, [axes...]).
+function _parse_operand(op)
+    Meta.isexpr(op, :ref) || error(
+        "@iron: each step argument must be `In(a)[axes...]` or `Out(a)[axes...]`, got `$op`"
+    )
+    callee, access = op.args[1], op.args[2:end]
+    (Meta.isexpr(callee, :call) && length(callee.args) == 2 && callee.args[1] in (:In, :Out)) ||
+        error("@iron: a step argument must wrap the buffer in `In(...)` or `Out(...)`, got `$op`")
+    all(a -> a isa Symbol, access) ||
+        error("@iron: the `[...]` of a step argument must be axis names, got `$op`")
+    dir = callee.args[1] === :In ? :in : :out
+    return (dir, callee.args[2], Symbol[access...])
+end
+
+# Build the `_schedule_launch` call from the `@iron for ... end` target and the
+# already-parsed `key = value` options (see the `@iron` macro in `launch.jl`).
+function _build_iron_schedule(forexpr, kws)
+    header, block = forexpr.args[1], forexpr.args[2]
+    Meta.isexpr(block, :block) || error("@iron: malformed `for` body")
+    space = _parse_for_axes(header)
+
+    init = step = nothing
+    operands = nothing
+    reduction = Tuple{Symbol, Any}[]
     for stmt in block.args
         stmt isa LineNumberNode && continue
-        if Meta.isexpr(stmt, :(=))
-            lhs, rhs = stmt.args
-            if lhs === :space
-                space = _parse_axes(rhs)
-            elseif lhs === :reduce
-                reduction = _parse_axes(rhs)
-            elseif lhs === :init
-                init = rhs
-            elseif lhs === :step
-                step = rhs
-            elseif lhs isa Symbol
-                push!(options, Expr(:kw, lhs, esc(rhs)))
-            else
-                error("@iron_schedule: unexpected setting `$stmt`")
-            end
-        elseif Meta.isexpr(stmt, :call) && length(stmt.args) == 3 && stmt.args[1] === :(=>)
-            lhsop, access = stmt.args[2], stmt.args[3]
-            (Meta.isexpr(lhsop, :call) && lhsop.args[1] in (:In, :Out) && length(lhsop.args) == 2) ||
-                error("@iron_schedule: an operand must be `In(a) => (axes...)` or `Out(a) => (axes...)`, got `$stmt`")
-            dir = lhsop.args[1] === :In ? :in : :out
-            push!(operands, (dir, lhsop.args[2], _parse_access(access)))
+        if Meta.isexpr(stmt, :macrocall) && stmt.args[1] === Symbol("@init")
+            init !== nothing && error("@iron: more than one `@init` in the `for` body")
+            initexpr = stmt.args[end]
+            init = Meta.isexpr(initexpr, :call) ? initexpr.args[1] : initexpr
+        elseif Meta.isexpr(stmt, :macrocall) && stmt.args[1] === Symbol("@reduce")
+            append!(reduction, _reduce_clauses(stmt.args[end]))
+        elseif Meta.isexpr(stmt, :call)
+            operands !== nothing && error(
+                "@iron: the `for` body must hold exactly one step call; found a second `$stmt`"
+            )
+            step = stmt.args[1]
+            operands = map(_parse_operand, stmt.args[2:end])
         else
-            error("@iron_schedule: unexpected line `$stmt`")
+            error("@iron: unexpected line in the `for` body: `$stmt`")
         end
     end
 
-    space === nothing && error("@iron_schedule: missing `space = (...)`")
-    init === nothing && error("@iron_schedule: missing `init = kernel`")
-    step === nothing && error("@iron_schedule: missing `step = kernel`")
-    isempty(operands) && error("@iron_schedule: no operands declared")
-    reduction === nothing && (reduction = Tuple{Symbol, Any}[])
+    step === nothing && error("@iron: the `for` body needs a step call `kernel(In(a)[...], Out(c)[...])`")
+    isempty(operands) && error("@iron: the step call declares no operands")
 
     ops_expr = Expr(:tuple, [
         Expr(:tuple, QuoteNode(dir), esc(arr), Expr(:tuple, QuoteNode.(access)...))
@@ -370,7 +341,8 @@ macro iron_schedule(block)
 
     return Expr(
         :call, _schedule_launch,
-        _axes_to_expr(space), _axes_to_expr(reduction), esc(init), esc(step), ops_expr,
-        options...,
+        _axes_to_expr(space), _axes_to_expr(reduction),
+        init === nothing ? :nothing : esc(init), esc(step), ops_expr,
+        kws...,
     )
 end

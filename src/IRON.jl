@@ -74,6 +74,6 @@ export ObjectFifo, Endpoint, producer, consumer
 export Worker, Runtime, start!, drain!, Program
 export generate_mlir, gemm_program
 export NPUArray, @allowscalar
-export @iron, @iron_schedule, In, Out
+export @iron, In, Out
 
 end # module
