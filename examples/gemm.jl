@@ -74,15 +74,17 @@ if get(ENV, "IRON_RUN", "0") == "1"
     dc = NPUArray{Tacc}(undef, Tile{Tacc, Tuple{M, N}})
 
     # C = A * B, in (m, k) x (k, n) tiles. `@cores nj` spreads the output columns across
-    # the compute-core array -- here N/n = 4 cores, each reducing its own column of
-    # output tiles concurrently. Tile shapes are inferred from each buffer and the extents
-    # of the axes indexing it (e.g. da is M x K indexed by (mi, kk) of extent (M/m, K/k),
-    # giving an m x k tile).
+    # the compute-core array -- here N/n = 4 cores, each reducing its own column of output
+    # tiles concurrently. `da` is not indexed by `nj`, so every core reads the same A
+    # tiles: `L2(In(da))` routes A through a MemTile and broadcasts it on-chip (one DDR
+    # read fanned to all cores) instead of each core re-reading it from DDR. Tile shapes
+    # are inferred from each buffer and the axis extents indexing it (e.g. da is M x K
+    # indexed by (mi, kk) of extent (M/m, K/k), giving an m x k tile).
     @iron stack_size = 3328 flags = AIECC_FLAGS for mi in 1:div(M, m), nj in 1:div(N, n)
         @cores nj
         @init gemm_zero!(dc)
         @reduce for kk in 1:div(K, k)
-            gemm_acc!(In(da)[mi, kk], In(db)[kk, nj], Out(dc)[mi, nj])
+            gemm_acc!(L2(In(da))[mi, kk], In(db)[kk, nj], Out(dc)[mi, nj])
         end
     end
 
