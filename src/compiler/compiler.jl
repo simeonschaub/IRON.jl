@@ -172,6 +172,8 @@ const VECTOR_OPS = Dict{Any, Any}(
     vsub => (arith.subf, arith.subi),
     vmul => (arith.mulf, arith.muli),
     vdiv => (arith.divf, arith.divsi),
+    vmax => (arith.maximumf, arith.maxsi),
+    vmin => (arith.minimumf, arith.minsi),
 )
 
 function emit_vector!(kc::KernelContext, block::IR.Block, jblock, inst, fn, ops, ssa)
@@ -220,6 +222,26 @@ function emit_vector!(kc::KernelContext, block::IR.Block, jblock, inst, fn, ops,
             error("Unsupported vector conversion from $from to $to")
         end
         op = builder(source; out = result(), location = loc(ctx))
+        push!(block, op)
+        kc.values[ssa] = IR.result(op, 1)
+        return nothing
+    end
+
+    if fn === vreinterpret
+        # Element type first, value second, as with `vconvert`; a bitcast is a pure
+        # relabel of the same bits, so the result vector type carries all the change.
+        source = lookup!(kc, block, ops[2])
+        op = arith.bitcast(source; out = result(), location = loc(ctx))
+        push!(block, op)
+        kc.values[ssa] = IR.result(op, 1)
+        return nothing
+    end
+
+    if fn === vexp
+        # The hardware exp: `convert-vector-to-aievec` turns `math.exp` on a bf16
+        # vector into the AIE exp intrinsic (bf16 only -- see `vexp`).
+        source = lookup!(kc, block, ops[1])
+        op = math.exp(source; result = result(), location = loc(ctx))
         push!(block, op)
         kc.values[ssa] = IR.result(op, 1)
         return nothing
@@ -306,7 +328,7 @@ function emit_call!(kc::KernelContext, block::IR.Block, jblock, inst)
         return emit_convert!(kc, block, ssa, source, from, inst[:type])
     end
 
-    if fn in (vload, vstore!, vbroadcast, vreduce_add, vfma, vconvert) ||
+    if fn in (vload, vstore!, vbroadcast, vreduce_add, vfma, vconvert, vreinterpret, vexp) ||
             haskey(VECTOR_OPS, fn)
         return emit_vector!(kc, block, jblock, inst, fn, ops, ssa)
     end

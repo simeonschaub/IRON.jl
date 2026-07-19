@@ -93,6 +93,35 @@ Widening bf16 to f32 is the case that matters: it is what makes an f32
 end
 
 """
+    vreinterpret(Vec{N,S}, v::Vec{N,T}) -> Vec{N,S}
+
+Reinterpret the bits of `v` as element type `S` (which must be the same width), as
+one `arith.bitcast` over vectors -- no numeric conversion, just a relabel.
+
+This is the door to bit-level tricks the hardware needs. An f32 vector max, for one,
+does not lower (`aievec.max` has no f32 form), but reading the bits as i32 -- where a
+negative float is a negative integer -- turns `relu` into an i32 `max`, which does.
+"""
+@noinline function vreinterpret(::Type{Vec{N, S}}, v::Vec{N, T}) where {N, S, T}
+    return Base.inferencebarrier(v)::Vec{N, S}
+end
+
+"""
+    vexp(v::Vec{N,T}) -> Vec{N,T}
+
+Elementwise `exp`, as one `math.exp` over the vector.
+
+The vector unit has a real exp: `convert-vector-to-aievec` lowers `math.exp` to the
+hardware exp on AIE2/AIE2p -- but **only for bf16** at 16 or 32 lanes (an f32 or
+scalar `math.exp` has no such lowering and reaches no exp instruction). So `exp` on
+this hardware means `exp` of a `Vec{16,BFloat16}`/`Vec{32,BFloat16}`; widen the result
+back to f32 for anything that follows (a softmax sum, say).
+"""
+@noinline function vexp(v::Vec{N, T}) where {N, T}
+    return Base.inferencebarrier(v)::Vec{N, T}
+end
+
+"""
     vreduce_add(v) -> T
 
 Sum the lanes of `v`, as one `vector.reduction`.
@@ -101,7 +130,7 @@ Sum the lanes of `v`, as one `vector.reduction`.
     return Base.inferencebarrier(zero(T))::T
 end
 
-for op in (:vadd, :vsub, :vmul, :vdiv)
+for op in (:vadd, :vsub, :vmul, :vdiv, :vmax, :vmin)
     @eval @noinline function $op(a::Vec{N, T}, b::Vec{N, T}) where {N, T}
         return Base.inferencebarrier(a)::Vec{N, T}
     end
@@ -125,7 +154,11 @@ Base.:*(a::Vec{N, T}, b::Vec{N, T}) where {N, T} = vmul(a, b)
 Base.:/(a::Vec{N, T}, b::Vec{N, T}) where {N, T} = vdiv(a, b)
 Base.muladd(a::Vec{N, T}, b::Vec{N, T}, c::Vec{N, T}) where {N, T} = vfma(a, b, c)
 Base.fma(a::Vec{N, T}, b::Vec{N, T}, c::Vec{N, T}) where {N, T} = vfma(a, b, c)
+Base.max(a::Vec{N, T}, b::Vec{N, T}) where {N, T} = vmax(a, b)
+Base.min(a::Vec{N, T}, b::Vec{N, T}) where {N, T} = vmin(a, b)
+Base.reinterpret(::Type{S}, v::Vec{N, T}) where {N, S, T} = vreinterpret(Vec{N, S}, v)
 Base.sum(v::Vec{N, T}) where {N, T} = vreduce_add(v)
+Base.exp(v::Vec{N, T}) where {N, T} = vexp(v)
 Base.zero(::Type{Vec{N, T}}) where {N, T} = vbroadcast(Vec{N, T}, zero(T))
 Base.one(::Type{Vec{N, T}}) where {N, T} = vbroadcast(Vec{N, T}, one(T))
 
