@@ -1,23 +1,21 @@
-# A tiled single-core GEMM, C = A * B, with the micro-kernel written in Julia.
+# A tiled single-core GEMM, C = A * B, with the micro-kernels written in Julia and the
+# schedule expressed with `@iron`'s `for` form.
 #
-# This is a port of single_core.py from mlir-aie's matrix_multiplication examples.
-# The Python design streams (m, k) x (k, n) tiles through object FIFOs and reduces
-# them on one core into an (m, n) output tile, binding an external C++ `mm.cc` for
-# the multiply. Here the two micro-kernels -- `gemm_zero!` and `gemm_acc!` -- are
-# ordinary Julia, and `gemm_program` (see src/gemm.jl) emits the same nested-acquire
-# core loop plus the tiled host DMA:
+# This is the minimal tiled *reduction*: (m, k) x (k, n) tiles stream through object
+# FIFOs and reduce on one core into an (m, n) output tile. The `@iron for` loop nest
+# spells out the schedule -- the outer loop is the output-tile iteration and the nested
+# `@reduce for` is the accumulation -- and IRON wires up the FIFOs, worker and host DMA:
 #
-#     for each (m, n) output tile:
-#         acquire C; gemm_zero!(C)
-#         for each of the K/k reduction tiles:
-#             acquire A, B; gemm_acc!(A, B, C)   # C += A * B
-#         release C
+#     for each (mi, nj) output tile:      # the space loop
+#         gemm_zero!(C)                    # @init
+#         for each kk reduction tile:      # the @reduce loop
+#             gemm_acc!(A, B, C)           # C += A * B
 #
 # A tile is column-major (Julia's convention), so the vectors run down columns: the
 # accumulator carries a column of C, `gemm_acc!` loads a column of A and broadcasts a
 # scalar of B, and the whole thing needs no transpose and no operand swap.
 #
-#   julia --project examples/gemm.jl
+#   IRON_RUN=1 julia --project examples/gemm.jl
 
 using IRON
 using BFloat16s: BFloat16
@@ -31,7 +29,7 @@ const m, k, n = 16, 32, 16
 """
     gemm_zero!(c)
 
-Clear an output tile, a column at a time.
+Clear an output tile, a column at a time. Run once per output tile by `@init`.
 """
 function gemm_zero!(c::Tile{Tacc, Tuple{m, n}}) where {Tacc, m, n}
     z = zero(Vec{m, Tacc})
@@ -68,15 +66,21 @@ const AIECC_FLAGS = ["--alloc-scheme=basic-sequential"]
 
 if get(ENV, "IRON_RUN", "0") == "1"
     Tin, Tacc = BFloat16, Float32
-    mlir = gemm_program(gemm_zero!, gemm_acc!, Tin, Tacc, M, K, N, m, k, n)
-    compiled = IRON.compile(mlir, 3; flags = AIECC_FLAGS)  # A, B, C
-
     # Small integers, exact in bf16, so the product can be compared for equality.
     a = BFloat16[(i + j) % 7 for i in 1:M, j in 1:K]
     b = BFloat16[(i - 2j) % 5 for i in 1:K, j in 1:N]
     da, db = NPUArray(a), NPUArray(b)
     dc = NPUArray{Tacc}(undef, Tile{Tacc, Tuple{M, N}})
-    IRON.run!(compiled, da, db, dc)
+
+    # C = A * B, in (m, k) x (k, n) tiles reduced on one core. Tile shapes are inferred
+    # from each buffer and the extents of the axes indexing it (e.g. da is M x K indexed
+    # by (mi, kk) of extent (M/m, K/k), giving an m x k tile).
+    @iron stack_size = 3328 flags = AIECC_FLAGS for mi in 1:div(M, m), nj in 1:div(N, n)
+        @init gemm_zero!(dc)
+        @reduce for kk in 1:div(K, k)
+            gemm_acc!(In(da)[mi, kk], In(db)[kk, nj], Out(dc)[mi, nj])
+        end
+    end
 
     result = Array(dc)
     expected = Tacc.(Float32.(a) * Float32.(b))
@@ -86,5 +90,6 @@ if get(ENV, "IRON_RUN", "0") == "1"
         println("MISMATCH in $(count(result .!= expected)) of $(length(expected))")
     end
 else
-    println(gemm_program(gemm_zero!, gemm_acc!, BFloat16, Float32, M, K, N, m, k, n))
+    println("Tiled single-core GEMM: C = A * B, $(M)x$(K)x$(N) in $(m)x$(k)x$(n) tiles.")
+    println("Run on an NPU with:  IRON_RUN=1 julia --project examples/gemm.jl")
 end
