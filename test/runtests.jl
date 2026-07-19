@@ -632,7 +632,7 @@ end
             gemm_zero!, gemm_acc!, lspecs, spatial, temporal, reduction,
             IRON.npu2, "main", 3328,
         )
-        @test count("tile_type = 1 : i32", lmlir) == 3        # three MemTiles (one group)
+        @test count("tile_type = 1 : i32", lmlir) == 2        # B+C share the group memtile; +A
         @test count("aie.objectfifo.link", lmlir) == 3
         for c in 0:(N ÷ n - 1)
             @test occursin("sym_name = \"op2_l2l1_c$(c)\"", lmlir)   # B distributed per core
@@ -653,7 +653,7 @@ end
             IRON.npu2, "main", 3328,
         )
         @test count("tile_type = 0 : i32", gmlir) == 8        # eight cores
-        @test count("tile_type = 1 : i32", gmlir) == 5        # 1 (A) + 2 (B) + 2 (C) memtiles
+        @test count("tile_type = 1 : i32", gmlir) == 3        # 2 group memtiles (B+C) + 1 (A)
         @test occursin("sym_name = \"op2_l3l2_g1\"", gmlir)   # second distribute group
         @test occursin("sym_name = \"op3_l2l3_g1\"", gmlir)   # second join group
         @test occursin("sym_name = \"op2_l2l1_c7\"", gmlir)   # global core index 7
