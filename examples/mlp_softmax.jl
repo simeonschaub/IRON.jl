@@ -150,8 +150,9 @@ const FLAGS = ["--alloc-scheme=basic-sequential"]
 linear!(dA, dW, dZ) =
     @iron stack_size = 3328 flags = FLAGS for bi in 1:size(dZ, 1) ÷ TILE, oj in 1:size(dZ, 2) ÷ TILE
         @init zero_tile!(dZ)
-        matmul_acc!(In(dA)[bi, kk], In(dW)[kk, oj], Out(dZ)[bi, oj])
-        @reduce kk = size(dW, 1) ÷ TILE
+        @reduce for kk in 1:size(dW, 1) ÷ TILE
+            matmul_acc!(In(dA)[bi, kk], In(dW)[kk, oj], Out(dZ)[bi, oj])
+        end
     end
 
 # H = relu(Z + B), a tiled map; H is bf16 (feeds the next matmul).

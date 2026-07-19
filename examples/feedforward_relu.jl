@@ -132,8 +132,9 @@ if get(ENV, "IRON_RUN", "0") == "1"
     #    Output tiles are (bi, oj); the accumulator is held across the kk reduction.
     @iron stack_size = 3328 flags = AIECC_FLAGS for bi in 1:BATCH÷TILE, oj in 1:OUT÷TILE
         @init zero_tile!(dZ)
-        matmul_acc!(In(dXa)[bi, kk], In(dWa)[kk, oj], Out(dZ)[bi, oj])
-        @reduce kk = (IN + 1) ÷ TILE
+        @reduce for kk in 1:(IN + 1)÷TILE
+            matmul_acc!(In(dXa)[bi, kk], In(dWa)[kk, oj], Out(dZ)[bi, oj])
+        end
     end
 
     # 2. Y = relu(Z), an elementwise map streamed over a grid of 16x16 tiles.
