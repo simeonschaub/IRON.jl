@@ -290,13 +290,26 @@ function emit_vector!(kc::KernelContext, block::IR.Block, jblock, inst, fn, ops,
     end
 
     if fn === vmatmul
-        # The shaped hardware matmul. We emit `aievec.matmul_aie2p` (AIE2P/npu2) directly --
-        # AIEVecToLLVM lowers it to the MAC-array intrinsic. The bf16 operands stay bf16 and
-        # the f32 accumulator is the result type.
+        # The shaped hardware matmul, emitted as a `vector.contract` -- `C[m,n] += A[m,k] *
+        # B[k,n]` -- and left for `convert-vector-to-aievec` to lower to `aievec.matmul`
+        # (that pass also reconciles the surrounding casts, which emitting the aievec op by
+        # hand does not). The contraction is the standard `(m, n, k)` gemm: A indexed
+        # `(m, k)`, B `(k, n)`, the accumulator `(m, n)`, reducing over `k`.
         a, b, c = (lookup!(kc, block, o) for o in ops)
-        op = create_op(
-            "aievec.matmul_aie2p", loc(ctx);
-            operands = IR.Value[a, b, c], results = [result()],
+        op = vector.contract(
+            a, b, c;
+            result_0 = result(),
+            indexing_maps = opaque_attr(
+                "[affine_map<(d0, d1, d2) -> (d0, d2)>, \
+                 affine_map<(d0, d1, d2) -> (d2, d1)>, \
+                 affine_map<(d0, d1, d2) -> (d0, d1)>]"; context = ctx,
+            ),
+            iterator_types = opaque_attr(
+                "[#vector.iterator_type<parallel>, #vector.iterator_type<parallel>, \
+                 #vector.iterator_type<reduction>]"; context = ctx,
+            ),
+            kind = opaque_attr("#vector.kind<add>"; context = ctx),
+            location = loc(ctx),
         )
         push!(block, op)
         kc.values[ssa] = IR.result(op, 1)

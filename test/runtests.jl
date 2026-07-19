@@ -246,14 +246,16 @@ end
     end
 
     @testset "matmul intrinsic lowering" begin
-        # `vmatmul` over `Mat` tiles lowers to `aievec.matmul_aie2p` on the 2-D vectors.
+        # `vmatmul` over `Mat` tiles emits a `vector.contract` over the 2-D vectors;
+        # `convert-vector-to-aievec` (in aiecc, not here) turns it into `aievec.matmul`.
         ir = lower(mm_tile!, Tuple{
             Tile{BFloat16, Tuple{4, 8}}, Tile{BFloat16, Tuple{8, 4}}, Tile{Float32, Tuple{4, 4}},
         })
-        @test occursin("aievec.matmul_aie2p", ir)
+        @test occursin("vector.contract", ir)
         @test occursin("vector<4x8xbf16>", ir)
         @test occursin("vector<8x4xbf16>", ir)
         @test occursin("vector<4x4xf32>", ir)
+        @test occursin("iterator_types", ir)
         @test occursin("vector.load", ir)
     end
 
