@@ -35,7 +35,7 @@ println(generate_mlir(program))
 module IRON
 
 using MLIR: IR, API
-using MLIR.Dialects: arith, scf, memref, vector
+using MLIR.Dialects: arith, scf, memref, vector, math
 using IRStructurizer
 using Adapt: Adapt, adapt
 using GPUArraysCore: GPUArraysCore, AbstractGPUArray, @allowscalar
