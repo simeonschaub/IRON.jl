@@ -20,6 +20,30 @@
 # annotated -- it follows from the buffer shape and the extents of the axes indexing
 # it: buffer dimension `d` of extent `D`, indexed by an axis of extent `E`, gives a
 # tile extent `D ÷ E`.
+#
+# `@cores <axis>` spreads a space axis across the compute-core array: that axis becomes
+# *spatial* (one output-tile position per core, run concurrently) while the remaining
+# space axes stay *temporal* (each core iterates them itself). One core reduces its own
+# output tiles exactly as the single-core design does; the host DMA feeds every core per
+# temporal step so they run in parallel:
+#
+#     @iron for mi in 1:div(M, m), nj in 1:div(N, n)
+#         @cores nj                                     # nj -> the core array
+#         @init gemm_zero!(C)
+#         @reduce for kk in 1:div(K, k); gemm_acc!(...); end
+#     end
+#
+# Each core gets its own shim tile hosting its operand FIFOs, so the design uses one shim
+# per core. That bounds this scheme to the device's shim columns (about 8 on npu2):
+# feeding more cores than there are shim tiles would force several cores onto one shim,
+# which does not have a DMA channel per core to spare. Scaling to the full array needs the
+# L2/MemTile relay (a later increment), which fans out to the cores on-chip.
+
+# Object FIFO depth: how many tiles the shim may buffer ahead of the core. Also the
+# ceiling on in-flight host DMA buffer descriptors per operand (see
+# `_emit_schedule_runtime!`), which is why it must stay well under the 16-BD-per-tile
+# hardware limit.
+const FIFO_DEPTH = 2
 
 # The launch behind the `for` form. `space`/`reduction` are tuples of `(name, extent)`;
 # `operands` is a tuple of `(direction, NPUArray, access)` where `access` is the tuple of
@@ -28,7 +52,7 @@ function _schedule_launch(
         space, reduction, @nospecialize(init), @nospecialize(step), operands;
         device::AIEDevice = npu2, name::AbstractString = "main",
         flags::AbstractVector{<:AbstractString} = String[], verbose::Bool = false,
-        stack_size::Integer = 1024,
+        stack_size::Integer = 1024, cores = (),
     )
     extent = Dict{Symbol, Int}()
     for (nm, ex) in space
@@ -39,6 +63,18 @@ function _schedule_launch(
     end
     space_names = Set(nm for (nm, _) in space)
     reduce_names = Set(nm for (nm, _) in reduction)
+
+    # `@cores` splits the space (output-tile) axes into the *spatial* axes -- mapped one
+    # tile position per compute core, so those iterations run concurrently across the
+    # array -- and the *temporal* axes each core still iterates itself. With no `@cores`
+    # every space axis is temporal and the design is single-core, as before.
+    core_names = Set(Symbol(a) for a in cores)
+    for a in core_names
+        a in space_names || error("IRON: `@cores` axis `$a` is not a space axis")
+    end
+    spatial = Tuple{Symbol, Int}[(nm, extent[nm]) for (nm, _) in space if nm in core_names]
+    temporal = Tuple{Symbol, Int}[(nm, extent[nm]) for (nm, _) in space if !(nm in core_names)]
+    num_cores = isempty(spatial) ? 1 : prod(e for (_, e) in spatial)
 
     # Per operand: infer the tile shape from the buffer and its access axes, and pin
     # down its FIFO name and host/kernel-side types.
@@ -70,6 +106,14 @@ function _schedule_launch(
             "IRON: output operand $(s.name) is indexed by a reduce axis; an accumulator \
             must be constant across the reduction (index it by space axes only)"
         )
+        # Each core owns one spatial tile position, so cores partition an output only if
+        # every spatial axis indexes it -- otherwise two cores would write the same tile.
+        s.dir === :out && for a in core_names
+            a in s.access || error(
+                "IRON: output operand $(s.name) is not indexed by `@cores` axis `$a`; the \
+                cores would write the same output tile (index every output by the core axes)"
+            )
+        end
     end
     any(s -> s.dir === :out, specs) ||
         error("IRON: an @iron reduction needs at least one `Out(...)` operand (the accumulator)")
@@ -80,10 +124,10 @@ function _schedule_launch(
         typeof(init), typeof(step),
         Tuple(s.buffer_type for s in specs), Tuple(s.tile_type for s in specs),
         Tuple(s.dir for s in specs), Tuple(Tuple(s.access) for s in specs),
-        Tuple(space), Tuple(reduction), device, String(name), Tuple(flags), Int(stack_size),
+        Tuple(spatial), Tuple(temporal), Tuple(reduction), device, String(name), Tuple(flags), Int(stack_size),
     )
     compiled = get!(_LAUNCH_CACHE, key) do
-        mlir = _build_schedule_program(init, step, specs, space, reduction, device, name, Int(stack_size))
+        mlir = _build_schedule_program(init, step, specs, spatial, temporal, reduction, device, name, Int(stack_size))
         compile(mlir, length(specs); flags, verbose)
     end
 
@@ -99,17 +143,18 @@ function _axis_coords(axes)
     return [Dict(axes[d][1] => c[d] - 1 for d in eachindex(axes)) for c in CartesianIndices(extents)]
 end
 
-# The core loop nest: acquire and initialise the outputs in the outer (space) loop,
-# then acquire the inputs and run the step kernel in the inner (reduce) loop,
-# accumulating into the outputs held across it. The core never
-# computes an access pattern -- it consumes tiles in FIFO order; the host DMA below
-# feeds the right tile.
-function _emit_schedule_core!(ctx::IR.Context, @nospecialize(init), @nospecialize(step), specs, num_space::Int, num_reduce::Int)
+# The core loop nest: acquire and initialise the outputs in the outer loop, then acquire
+# the inputs and run the step kernel in the inner (reduce) loop, accumulating into the
+# outputs held across it. `num_outer` is how many output tiles this core owns -- the
+# temporal (non-`@cores`) space positions; the spatial positions are spread over the
+# other cores. The core never computes an access pattern -- it consumes tiles in FIFO
+# order; the host DMA below feeds the right tile.
+function _emit_schedule_core!(ctx::IR.Context, @nospecialize(init), @nospecialize(step), specs, num_outer::Int, num_reduce::Int)
     body = IR.Block(IR.Type[], IR.Location[])
     index = IR.IndexType(; context = ctx)
     const_(v) = (op = arith.constant(; value = IR.Attribute(v, index), location = loc(ctx)); push!(body, op); IR.result(op, 1))
     c0, c1 = const_(0), const_(1)
-    cspace, creduce = const_(num_space), const_(num_reduce)
+    cspace, creduce = const_(num_outer), const_(num_reduce)
 
     inputs = [s for s in specs if s.dir === :in]
     outputs = [s for s in specs if s.dir === :out]
@@ -169,75 +214,133 @@ function _emit_schedule_core!(ctx::IR.Context, @nospecialize(init), @nospecializ
     return region(body)
 end
 
-# The host DMA: for each output tile (a space coordinate), stream every input tile the
-# reduction reads -- addressing each operand
-# through its access axes -- then drain the output tile, waiting on it before the next.
-function _emit_schedule_runtime!(ctx::IR.Context, specs, space, reduction)
+# The host DMA. One temporal (output-tile) step at a time; within a step feed *every*
+# core its reduction inputs and start draining its output, so the cores compute their
+# tiles concurrently, then wait on all the outputs. With a single core (`num_cores == 1`,
+# no spatial axes) the core loop and coordinate collapse to exactly the earlier
+# single-core schedule. Each operand is addressed through its access axes; the spatial
+# axes come from the core's coordinate, the temporal and reduce axes from the loops.
+function _emit_schedule_runtime!(ctx::IR.Context, specs, spatial, temporal, reduction, num_cores::Int)
     arg_types = IR.Type[memref_type(ctx, s.buffer_type) for s in specs]
     body = IR.Block(arg_types, [loc(ctx) for _ in specs])
     args = IR.Value[IR.argument(body, i) for i in eachindex(specs)]
 
-    function task(i, grid; token)
+    function task(i, fname, grid; token)
         s = specs[i]
         offset, dims, len = _tile_pattern(size(s.buffer_type), size(s.tile_type), grid)
         bd = IR.Block(IR.Type[], IR.Location[])
         push!(bd, dma_bd_op(ctx, args[i], dims, len; offset))
         push!(bd, end_op(ctx))
-        t = dma_configure_task_for_op(ctx, s.name, region(bd); issue_token = token)
+        t = dma_configure_task_for_op(ctx, fname, region(bd); issue_token = token)
         push!(body, t)
         push!(body, dma_start_task_op(ctx, IR.result(t, 1)))
         return IR.result(t, 1)
     end
+    retire(t) = (push!(body, dma_await_task_op(ctx, t)); push!(body, dma_free_task_op(ctx, t)))
 
     grid_of(s, coord) = Tuple(coord[a] for a in s.access)
+    in_ops = [i for (i, s) in enumerate(specs) if s.dir === :in]
+    out_ops = [i for (i, s) in enumerate(specs) if s.dir === :out]
+    core_coords = _axis_coords(spatial)   # one spatial coordinate per core
 
-    for sc in _axis_coords(space)
-        pending, outs = IR.Value[], IR.Value[]
+    for tc in _axis_coords(temporal)
+        # A sliding window of in-flight input BDs, one queue per (operand, core) FIFO. The
+        # shim runs at most `FIFO_DEPTH` tiles ahead of a core before its object FIFO
+        # backpressures, so configuring more up front buys no overlap and just burns buffer
+        # descriptors (a tile holds at most 16). Await + free the oldest before the next.
+        inflight = Dict((i, c) => IR.Value[] for i in in_ops, c in 0:(num_cores - 1))
+
+        # Advance the reduction in lockstep across the cores: feed *every* core its rc-th
+        # input tiles before moving to rc+1. The window's await then paces all cores
+        # together, so they compute concurrently -- feeding one core's whole reduction
+        # first would gate the next core on this core's progress and serialise them.
         for rc in _axis_coords(reduction)
-            full = merge(sc, rc)
-            for (i, s) in enumerate(specs)
-                s.dir === :in || continue
-                push!(pending, task(i, grid_of(s, full); token = false))
+            for (c, sc) in enumerate(core_coords)
+                cidx = c - 1
+                full = merge(merge(sc, tc), rc)
+                for i in in_ops
+                    q = inflight[(i, cidx)]
+                    length(q) >= FIFO_DEPTH && retire(popfirst!(q))
+                    push!(q, task(i, _fifo_name(i, cidx, num_cores), grid_of(specs[i], full); token = true))
+                end
             end
         end
-        for (i, s) in enumerate(specs)
-            s.dir === :out || continue
-            push!(outs, task(i, grid_of(s, sc); token = true))
+
+        # Start and wait on every core's output tile, then retire the trailing inputs.
+        outs = IR.Value[]
+        for (c, sc) in enumerate(core_coords)
+            cidx = c - 1
+            for i in out_ops
+                push!(outs, task(i, _fifo_name(i, cidx, num_cores), grid_of(specs[i], merge(sc, tc)); token = true))
+            end
         end
         for o in outs
             push!(body, dma_await_task_op(ctx, o))
         end
-        for p in pending
-            push!(body, dma_free_task_op(ctx, p))
+        for c in 0:(num_cores - 1), i in in_ops, t in inflight[(i, c)]
+            retire(t)
         end
     end
     return runtime_sequence_op(ctx, "sequence", region(body))
 end
 
+# The object FIFO for operand `i` feeding/draining core `c` (0-based). With a single
+# core the plain `op$i` name keeps the design byte-identical to the pre-`@cores` one.
+_fifo_name(i, c, num_cores) = num_cores == 1 ? "op$i" : "op$(i)_c$c"
+
 function _build_schedule_program(
-        @nospecialize(init), @nospecialize(step), specs, space, reduction,
+        @nospecialize(init), @nospecialize(step), specs, spatial, temporal, reduction,
         device::AIEDevice, name::AbstractString, stack_size::Int; ctx::IR.Context = context(),
     )
-    num_space = isempty(space) ? 1 : prod(Int(e) for (_, e) in space)
+    num_temporal = isempty(temporal) ? 1 : prod(Int(e) for (_, e) in temporal)
     num_reduce = isempty(reduction) ? 1 : prod(Int(e) for (_, e) in reduction)
+    num_cores = isempty(spatial) ? 1 : prod(Int(e) for (_, e) in spatial)
 
     device_body = IR.Block(IR.Type[], IR.Location[])
-    core = logical_tile_op(ctx, CoreTile)
-    push!(device_body, core)
-    core_tile = IR.result(core, 1)
-    shims = IR.Value[]
-    for _ in specs
-        t = logical_tile_op(ctx, ShimNOCTile)
-        push!(device_body, t)
-        push!(shims, IR.result(t, 1))
+
+    if num_cores == 1
+        # Single core: one shim tile per operand, exactly as the pre-`@cores` design (the
+        # tile order and `op$i` FIFO names are preserved so the emitted module is
+        # unchanged for existing single-core schedules).
+        core = logical_tile_op(ctx, CoreTile)
+        push!(device_body, core)
+        core_tile = IR.result(core, 1)
+        shims = IR.Value[]
+        for _ in specs
+            t = logical_tile_op(ctx, ShimNOCTile)
+            push!(device_body, t)
+            push!(shims, IR.result(t, 1))
+        end
+        for (i, s) in enumerate(specs)
+            into_core, from_core = shims[i], core_tile
+            producer_tile, consumer_tile = s.dir === :in ? (into_core, from_core) : (from_core, into_core)
+            push!(device_body, objectfifo_op(ctx, s.name, producer_tile, IR.Value[consumer_tile], objectfifo_type(ctx, s.tile_type), FIFO_DEPTH))
+        end
+        push!(device_body, core_op(ctx, core_tile, _emit_schedule_core!(ctx, init, step, specs, num_temporal, num_reduce); stack_size))
+    else
+        # Multi-core: one shim tile *per core*, hosting that core's operand FIFOs. So the
+        # shim count is the core count (bounded by the device's shim columns), and each
+        # shim needs only one DMA channel per operand -- not one channel per core, which a
+        # single shared shim tile could not supply. Each core runs the same program over
+        # its temporal slice, reading/writing its own FIFOs.
+        for c in 0:(num_cores - 1)
+            core = logical_tile_op(ctx, CoreTile)
+            push!(device_body, core)
+            core_tile = IR.result(core, 1)
+            shim = logical_tile_op(ctx, ShimNOCTile)
+            push!(device_body, shim)
+            shim_tile = IR.result(shim, 1)
+            core_specs = map(enumerate(specs)) do (i, s)
+                fname = _fifo_name(i, c, num_cores)
+                producer_tile, consumer_tile = s.dir === :in ? (shim_tile, core_tile) : (core_tile, shim_tile)
+                push!(device_body, objectfifo_op(ctx, fname, producer_tile, IR.Value[consumer_tile], objectfifo_type(ctx, s.tile_type), FIFO_DEPTH))
+                merge(s, (; name = fname))
+            end
+            push!(device_body, core_op(ctx, core_tile, _emit_schedule_core!(ctx, init, step, core_specs, num_temporal, num_reduce); stack_size))
+        end
     end
-    for (i, s) in enumerate(specs)
-        into_core, from_core = shims[i], core_tile
-        producer_tile, consumer_tile = s.dir === :in ? (into_core, from_core) : (from_core, into_core)
-        push!(device_body, objectfifo_op(ctx, s.name, producer_tile, IR.Value[consumer_tile], objectfifo_type(ctx, s.tile_type), 2))
-    end
-    push!(device_body, core_op(ctx, core_tile, _emit_schedule_core!(ctx, init, step, specs, num_space, num_reduce); stack_size))
-    push!(device_body, _emit_schedule_runtime!(ctx, specs, space, reduction))
+
+    push!(device_body, _emit_schedule_runtime!(ctx, specs, spatial, temporal, reduction, num_cores))
     push!(device_body, end_op(ctx))
 
     mod = IR.Module(loc(ctx))
@@ -322,12 +425,25 @@ function _build_iron_schedule(forexpr, kws)
 
     init = step = operands = nothing
     reduction = Tuple{Symbol, Any}[]
+    coreaxes = Symbol[]
     for stmt in block.args
         stmt isa LineNumberNode && continue
         if Meta.isexpr(stmt, :macrocall) && stmt.args[1] === Symbol("@init")
             init === nothing || error("@iron: more than one `@init` in the `for` body")
             initexpr = stmt.args[end]
             init = Meta.isexpr(initexpr, :call) ? initexpr.args[1] : initexpr
+        elseif Meta.isexpr(stmt, :macrocall) && stmt.args[1] === Symbol("@cores")
+            isempty(coreaxes) || error("@iron: more than one `@cores` directive in the `for` body")
+            for p in stmt.args[3:end]   # args[2] is the LineNumberNode
+                if p isa Symbol
+                    push!(coreaxes, p)
+                elseif Meta.isexpr(p, :tuple) && all(a -> a isa Symbol, p.args)
+                    append!(coreaxes, p.args)
+                else
+                    error("@iron: `@cores` takes space axis names, as in `@cores nj`, got `$p`")
+                end
+            end
+            isempty(coreaxes) && error("@iron: `@cores` needs at least one axis name")
         elseif Meta.isexpr(stmt, :macrocall) && stmt.args[1] === Symbol("@reduce")
             operands === nothing || error("@iron: the `for` body declares its step more than once")
             redfor = stmt.args[end]
@@ -350,15 +466,27 @@ function _build_iron_schedule(forexpr, kws)
     )
     isempty(operands) && error("@iron: the step call declares no operands")
 
+    space_syms = Set(nm for (nm, _) in space)
+    for a in coreaxes
+        a in space_syms ||
+            error("@iron: `@cores` axis `$a` is not one of the `for` (space) axes")
+    end
+
     ops_expr = Expr(:tuple, [
         Expr(:tuple, QuoteNode(dir), esc(arr), Expr(:tuple, QuoteNode.(access)...))
         for (dir, arr, access) in operands
     ]...)
 
+    # `@cores` becomes a `cores = (:axis, ...)` keyword on the launch call, alongside the
+    # user's own options in `kws`.
+    allkws = copy(kws)
+    isempty(coreaxes) ||
+        push!(allkws, Expr(:kw, :cores, Expr(:tuple, QuoteNode.(coreaxes)...)))
+
     return Expr(
         :call, _schedule_launch,
         _axes_to_expr(space), _axes_to_expr(reduction),
         init === nothing ? :nothing : esc(init), esc(step), ops_expr,
-        kws...,
+        allkws...,
     )
 end
