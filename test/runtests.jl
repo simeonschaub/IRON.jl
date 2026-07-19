@@ -82,9 +82,9 @@ function matmul_vec!(
     return nothing
 end
 
-# The tiled-GEMM micro-kernels (see src/gemm.jl and examples/gemm.jl): `gemm_zero!`
-# clears an output tile and `gemm_acc!` accumulates `c += a * b` into it, so driving
-# the pair tile by tile reduces a full C = A * B.
+# The tiled-GEMM micro-kernels (see examples/gemm.jl): `gemm_zero!` clears an output
+# tile and `gemm_acc!` accumulates `c += a * b` into it, so driving the pair tile by
+# tile reduces a full C = A * B.
 function gemm_zero!(c::Tile{Tacc, Tuple{m, n}}) where {Tacc, m, n}
     z = zero(Vec{m, Tacc})
     for j in 1:n
@@ -523,29 +523,6 @@ end
             Cbig[(mi * m + 1):(mi * m + m), (nj * n + 1):(nj * n + n)] = ctile
         end
         @test Cbig == Float32.(Abig) * Float32.(Bbig)
-
-        # tile_access reports the column-major access pattern of a tile: the offset is
-        # the linear index of its top-left element, the pattern walks it column by
-        # column, and the length is its element count. Tile (1, 0) of an (m, k) tiling
-        # of an M x K buffer starts one tile-row down: element (m, 0), offset m.
-        off, dims, len = IRON.tile_access(M, K, m, k, 1, 0)
-        @test off == 1 * m + 0 * k * M
-        @test len == m * k
-        @test dims == [(1, 0), (1, 0), (k, K), (m, 1)]
-
-        # gemm_program emits a valid, round-tripping module: one core, three FIFOs,
-        # the core acquiring outC as a producer and inA/inB as consumers, the MAC in
-        # the reduction body, and one awaited C drain per output tile.
-        gemm_mlir = gemm_program(gemm_zero!, gemm_acc!, BFloat16, Float32, M, K, N, m, k, n)
-        mod = parse(IR.Module, gemm_mlir; context = context())
-        @test IR.verify(IR.Operation(mod))
-        @test occursin("sym_name = \"inA\"", gemm_mlir)
-        @test occursin("sym_name = \"inB\"", gemm_mlir)
-        @test occursin("sym_name = \"outC\"", gemm_mlir)
-        @test occursin("objFifo_name = @outC, port = 0 : i32", gemm_mlir)  # core produces C
-        @test occursin("objFifo_name = @inA, port = 1 : i32", gemm_mlir)   # core consumes A
-        @test occursin("vector.fma", gemm_mlir)
-        @test count("aiex.dma_await_task", gemm_mlir) == Mt * Nt  # one drain per output tile
     end
 
     @testset "generated module round-trips" begin

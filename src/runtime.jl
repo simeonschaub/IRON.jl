@@ -155,7 +155,7 @@ end
 
 Compile a design to an NPU xclbin + instruction stream with `aiecc`/Peano, and wrap
 the result. The first form generates `program`'s MLIR; the second takes MLIR text
-directly (e.g. from [`gemm_program`](@ref)) together with `nargs`, the number of
+directly (e.g. from [`generate_mlir`](@ref)) together with `nargs`, the number of
 runtime-sequence buffers it takes. `path`, if given, is where the `.mlir` is written;
 otherwise it goes under `workdir`. `flags` are passed through to `aiecc` (e.g.
 `["--alloc-scheme=basic-sequential"]`). `peano` overrides the Peano/llvm-aie install
