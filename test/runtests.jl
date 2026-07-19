@@ -108,6 +108,18 @@ function gemm_acc!(
     return nothing
 end
 
+# One AIE2P matrix-multiply tile: 4x8 * 8x4 -> 4x4, accumulating in f32.
+function mm_tile!(
+        a::Tile{BFloat16, Tuple{4, 8}}, b::Tile{BFloat16, Tuple{8, 4}},
+        c::Tile{Float32, Tuple{4, 4}},
+    )
+    av = vload(Mat{4, 8, BFloat16}, a, 1, 1)
+    bv = vload(Mat{8, 4, BFloat16}, b, 1, 1)
+    acc = vload(Mat{4, 4, Float32}, c, 1, 1)
+    vstore!(vmatmul(av, bv, acc), c, 1, 1)
+    return nothing
+end
+
 # Too few subscripts for the tile's rank.
 function bad_rank(a::Tile{Float32, Tuple{4, 4}}, b::Tile{Float32, Tuple{4, 4}})
     for i in 1:4
@@ -231,6 +243,18 @@ end
         # A dead comparison, left behind by turning the loop's exit test into scf.for
         # bounds, is not emitted.
         @test !occursin("arith.cmpi", ir)
+    end
+
+    @testset "matmul intrinsic lowering" begin
+        # `vmatmul` over `Mat` tiles lowers to `aievec.matmul_aie2p` on the 2-D vectors.
+        ir = lower(mm_tile!, Tuple{
+            Tile{BFloat16, Tuple{4, 8}}, Tile{BFloat16, Tuple{8, 4}}, Tile{Float32, Tuple{4, 4}},
+        })
+        @test occursin("aievec.matmul_aie2p", ir)
+        @test occursin("vector<4x8xbf16>", ir)
+        @test occursin("vector<8x4xbf16>", ir)
+        @test occursin("vector<4x4xf32>", ir)
+        @test occursin("vector.load", ir)
     end
 
     @testset "unsupported kernels are rejected" begin

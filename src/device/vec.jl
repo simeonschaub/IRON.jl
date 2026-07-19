@@ -44,6 +44,23 @@ Base.eltype(::Type{Vec{N, T}}) where {N, T} = T
 Base.length(::Type{Vec{N, T}}) where {N, T} = N
 lanes(::Type{Vec{N, T}}) where {N, T} = N
 
+"""
+    Mat{R, C, T}
+
+An `R`x`C` matrix tile held in a hardware vector register -- a rank-2 `vector<RxCxT>`.
+Unlike [`Vec`](@ref) (a 1-D SIMD vector), a `Mat` is the shape the AIE matrix-multiply
+unit consumes: [`vmatmul`](@ref) takes an `R`x`K` and a `K`x`C` `Mat` and accumulates
+into an `R`x`C` one. The valid shapes/types are the hardware's -- for AIE2P bf16 that is
+`4`x`8` * `8`x`4` -> `4`x`4` f32.
+"""
+struct Mat{R, C, T}
+    # Non-singleton for the same reason as `Vec` (see above); never read.
+    data::NTuple{R, NTuple{C, T}}
+end
+
+Base.eltype(::Type{Mat{R, C, T}}) where {R, C, T} = T
+Base.size(::Type{Mat{R, C, T}}) where {R, C, T} = (R, C)
+
 # The intrinsics. Each is `@noinline` so the call survives into the IR, and returns
 # through `inferencebarrier` so inference cannot fold it away. None may construct a
 # `Vec`: `zero(Vec{N,T})` is defined below in terms of `vbroadcast`, so building one
@@ -144,6 +161,41 @@ around.
 """
 @noinline function vfma(a::Vec{N, T}, b::Vec{N, T}, c::Vec{N, T}) where {N, T}
     return Base.inferencebarrier(a)::Vec{N, T}
+end
+
+# --- matrix intrinsics -------------------------------------------------------
+# The `Mat` counterparts of `vload`/`vstore!` (a 2-D `vector.load`/`vector.store`) plus
+# the matrix-multiply the vector unit accelerates.
+
+"""
+    vload(Mat{R,C,T}, tile, i, j) -> Mat{R,C,T}
+
+Read the `R`x`C` block of `tile` at `(i, j)` as one rank-2 `vector.load`.
+"""
+@noinline function vload(::Type{Mat{R, C, T}}, tile::Tile, I::Int...) where {R, C, T}
+    return Base.inferencebarrier(tile)::Mat{R, C, T}
+end
+
+"""
+    vstore!(m::Mat, tile, i, j)
+
+Write the `R`x`C` matrix `m` to `tile` at `(i, j)` as one rank-2 `vector.store`.
+"""
+@noinline function vstore!(m::Mat{R, C, T}, tile::Tile, I::Int...) where {R, C, T}
+    Base.donotdelete(m, tile, I)
+    return nothing
+end
+
+"""
+    vmatmul(a::Mat{R,K}, b::Mat{K,C}, acc::Mat{R,C}) -> Mat{R,C}
+
+`a * b + acc` on the AIE matrix-multiply unit, as one `aievec.matmul`. This is the
+shaped matmul that keeps the MAC array saturated -- far more MACs per load than the
+scalar-broadcast `vfma`. On AIE2P the supported bf16 shape is `4`x`8` * `8`x`4` -> `4`x`4`
+accumulating in f32; the operands are widened bf16, the accumulator/result f32.
+"""
+@noinline function vmatmul(a::Mat{R, K, T}, b::Mat{K, C, T}, acc::Mat{R, C, S}) where {R, K, C, T, S}
+    return Base.inferencebarrier(acc)::Mat{R, C, S}
 end
 
 # The surface a kernel writes. These inline away, leaving the intrinsics; because
