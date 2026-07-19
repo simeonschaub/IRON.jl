@@ -78,9 +78,25 @@ function gemm_launch_cores!(da, db, dc, M, K, N, m, k, n)
     return nothing
 end
 
+# The same multi-core GEMM with every operand routed through a MemTile (`L2(...)`): A
+# broadcasts to the cores, B distributes, C joins, so A crosses DDR once instead of once
+# per core. distribute/join go through a single memtile, capped at ~5 cores for now.
+function gemm_launch_l2!(da, db, dc, M, K, N, m, k, n)
+    @iron stack_size = 3328 flags = AIECC_FLAGS for mi in 1:div(M, m), nj in 1:div(N, n)
+        @cores nj
+        @init gemm_zero!(dc)
+        @reduce for kk in 1:div(K, k)
+            gemm_acc!(L2(In(da))[mi, kk], L2(In(db))[kk, nj], L2(Out(dc))[mi, nj])
+        end
+    end
+    return nothing
+end
+
 # The current scheme uses one shim tile per core, so it fits within the device's shim
 # columns (about 8 on npu2). Scaling past that needs L2 forwarding.
 const MAX_CORES = 8
+# distribute/join fan a single memtile out to one FIFO per core, capped by its DMA channels.
+const MAX_L2_CORES = 5
 
 # --- one size ----------------------------------------------------------------
 
@@ -169,6 +185,33 @@ if get(ENV, "IRON_RUN", "0") == "1"
             @printf("%-12s  %5s  %s\n", "$(s)³", "ERR", note)
         end
     end
+
+    # Does routing operands through MemTiles (`L2(...)`) actually help? Isolate its effect at
+    # a fixed 4 cores (within the distribute/join cap) on a *tall* GEMM (N = 64 -> 4 columns,
+    # large M·K) where A dominates data movement: L2 broadcasts A once instead of re-reading
+    # it per core, so a win here says L2 is the lever on this DMA-bound design.
+    println()
+    @printf("%-14s  %5s  %6s  %12s  %12s  %8s\n",
+            "M=K (N=64)", "ok", "cores", "no-L2 GF/s", "L2 GF/s", "L2 gain")
+    println("-"^66)
+    for s in [128, 256, 512]
+        M = K = s; N = 64; m, k, n = 16, 32, 16          # N/n = 4 cores, within MAX_L2_CORES
+        try
+            a = BFloat16[(i + j) % 7 for i in 1:M, j in 1:K]
+            b = BFloat16[(i - 2j) % 5 for i in 1:K, j in 1:N]
+            da, db = NPUArray(a), NPUArray(b)
+            dc = NPUArray{Tacc}(undef, Tile{Tacc, Tuple{M, N}})
+            nol2 = time_launch(gemm_launch_cores!, da, db, dc, a, b, M, K, N, m, k, n; trials = 20)
+            l2 = time_launch(gemm_launch_l2!, da, db, dc, a, b, M, K, N, m, k, n; trials = 20)
+            ok = nol2.ok && l2.ok
+            @printf("%-14s  %5s  %6d  %12.2f  %12.2f  %7.2fx\n",
+                    "$(M)x$(K)", ok ? "yes" : "NO", div(N, n),
+                    nol2.gflops, l2.gflops, l2.gflops / nol2.gflops)
+        catch e
+            @printf("%-14s  %5s  %s\n", "$(M)x$(K)", "ERR", sprint(showerror, e))
+        end
+    end
+
     println()
     println("GFLOP/s = 2*M*N*K / min time. Times are end-to-end (host sync + launch + sync).")
     println("`@cores nj` spreads N/n output columns across that many compute cores;")
