@@ -525,6 +525,73 @@ end
         @test Cbig == Float32.(Abig) * Float32.(Bbig)
     end
 
+    @testset "@cores lowering" begin
+        # The `for`-form front end turns `@cores nj` into a `cores = (:nj,)` keyword on
+        # the launch call, and rejects misuse. `_build_iron_schedule` is pure Expr work.
+        withcores = :(for mi in 1:div(M, m), nj in 1:div(N, n)
+            @cores nj
+            @reduce for kk in 1:div(K, k)
+                gemm_acc!(In(da)[mi, kk], In(db)[kk, nj], Out(dc)[mi, nj])
+            end
+        end)
+        call = IRON._build_iron_schedule(withcores, Expr[])
+        kw = filter(a -> Meta.isexpr(a, :kw) && a.args[1] === :cores, call.args)
+        @test length(kw) == 1
+        @test kw[1].args[2] == Expr(:tuple, QuoteNode(:nj))
+
+        # No directive -> no cores keyword (single-core, as before).
+        plain = :(for mi in 1:div(M, m), nj in 1:div(N, n)
+            @reduce for kk in 1:div(K, k)
+                gemm_acc!(In(da)[mi, kk], In(db)[kk, nj], Out(dc)[mi, nj])
+            end
+        end)
+        @test isempty(filter(a -> Meta.isexpr(a, :kw) && a.args[1] === :cores,
+                             IRON._build_iron_schedule(plain, Expr[]).args))
+
+        # `@cores` naming a non-space axis is rejected at expansion time.
+        bad = :(for mi in 1:div(M, m), nj in 1:div(N, n)
+            @cores kk
+            @reduce for kk in 1:div(K, k)
+                gemm_acc!(In(da)[mi, kk], In(db)[kk, nj], Out(dc)[mi, nj])
+            end
+        end)
+        @test_throws Exception IRON._build_iron_schedule(bad, Expr[])
+    end
+
+    @testset "multi-core schedule module" begin
+        # Build the operand specs the way `_schedule_launch` does (arrays are unused by
+        # `_build_schedule_program`, so a placeholder suffices), then check the emitted
+        # design has one core per spatial position with per-core FIFOs.
+        m, k, n = 16, 32, 16
+        M, K, N = 64, 64, 64
+        spec(dir, T, buf, tl, ax, nm) = (
+            dir = dir, array = nothing, access = ax, name = nm,
+            buffer_type = Tile{T, Tuple{buf...}}, tile_type = Tile{T, Tuple{tl...}},
+        )
+        specs = [
+            spec(:in, BFloat16, (M, K), (m, k), [:mi, :kk], "op1"),
+            spec(:in, BFloat16, (K, N), (k, n), [:kk, :nj], "op2"),
+            spec(:out, Float32, (M, N), (m, n), [:mi, :nj], "op3"),
+        ]
+        spatial = [(:nj, N ÷ n)]     # 4 cores
+        temporal = [(:mi, M ÷ m)]
+        reduction = [(:kk, K ÷ k)]
+        mlir = IRON._build_schedule_program(
+            gemm_zero!, gemm_acc!, specs, spatial, temporal, reduction,
+            IRON.npu2, "main", 3328,
+        )
+
+        # One compute tile and one shim tile per nj (each core owns its own shim).
+        @test count("tile_type = 0 : i32", mlir) == N ÷ n   # CoreTiles
+        @test count("tile_type = 2 : i32", mlir) == N ÷ n   # ShimNOCTiles, one per core
+        @test count("aie.core", mlir) == N ÷ n
+
+        # Per-core FIFO names for every operand and core.
+        for c in 0:(N ÷ n - 1), i in 1:3
+            @test occursin("sym_name = \"op$(i)_c$(c)\"", mlir)
+        end
+    end
+
     @testset "generated module round-trips" begin
         # Re-parsing the text is the closest check available without the toolchain to
         # what aie-opt does first: syntax, types and attributes must all be valid.
