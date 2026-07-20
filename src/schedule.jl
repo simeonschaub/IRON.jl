@@ -415,14 +415,14 @@ function _dims_to_stream_blocks(m::Int, k::Int, r::Int, s::Int)
     return Tuple{Int, Int}[(m ÷ r, r), (k ÷ s, s * m), (s, m), (r, 1)]
 end
 
-# The inverse, for a joined output: read `gsize` cores' block-columnar `(m, n)` tiles (each
-# `rxt` block a column, blocks m-first) out of the memtile and emit them column-major, back
-# to the DDR `(m, n*gsize)` super-tile order. Restricted to a single n-block (`n == t`) so it
-# stays within a memtile's 4 DMA dimensions.
-function _dims_to_stream_unblock(m::Int, n::Int, r::Int, t::Int, gsize::Int)
+# The inverse, for a joined output: read one core's block-columnar `(m, n)` tile (each `rxt`
+# block a column, blocks m-first) out of the memtile and emit it column-major, back to the
+# DDR order. Applied per join input; the link's `src_offsets` concatenate the cores. Restricted
+# to a single n-block (`n == t`) so it stays within a memtile's DMA dimensions.
+function _dims_to_stream_unblock(m::Int, n::Int, r::Int, t::Int)
     n == t || error("IRON: output sub-tiling needs a single n-block (n == t = $t), got n = $n")
     m % r == 0 || error("IRON: matmul block row $r does not tile output tile rows $m")
-    return Tuple{Int, Int}[(gsize, m * n), (t, r), (m ÷ r, r * t), (r, 1)]
+    return Tuple{Int, Int}[(t, r), (m ÷ r, r * t), (r, 1)]
 end
 
 # A single memtile can only fan out to (in from) one FIFO per core over its DMA channels,
@@ -553,7 +553,7 @@ function _build_schedule_program(
                         Tuple{Int, Int}[]
                     else
                         md, nd = size(s.tile_type)
-                        _dims_to_stream_unblock(md, nd, s.blocks[1], s.blocks[2], gsize)
+                        _dims_to_stream_unblock(md, nd, s.blocks[1], s.blocks[2])
                     end
                     push!(device_body, objectfifo_op(ctx, l2l3, mem_tile, IR.Value[shim_tile], super_of, FIFO_DEPTH; dims_to_stream = l2l3_dims))
                     ins = String[]
