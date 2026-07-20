@@ -533,7 +533,12 @@ function _build_schedule_program(
             bcast_i += 1
             l3l2, l2l1 = "op$(i)_l3l2", "op$(i)_l2l1"
             push!(device_body, objectfifo_op(ctx, l3l2, IR.result(shim, 1), IR.Value[mem_tile], tile_of, FIFO_DEPTH))
-            push!(device_body, objectfifo_op(ctx, l2l1, mem_tile, core_tiles, tile_of, FIFO_DEPTH))
+            # `dims_to_stream` on the memtile->core FIFO is the data-layout transform that
+            # will make matmul sub-tiles contiguous. An identity (whole tile, unit stride)
+            # is a no-op that proves it compiles on this MemTile producer -- the real
+            # block-columnar patterns replace it next.
+            l2l1_dims = Tuple{Int, Int}[(prod(size(s.tile_type)), 1)]
+            push!(device_body, objectfifo_op(ctx, l2l1, mem_tile, core_tiles, tile_of, FIFO_DEPTH; dims_to_stream = l2l1_dims))
             push!(device_body, objectfifo_link_op(ctx, [l3l2], [l2l1]))
             for c in 1:num_cores
                 corefifo[c][i] = l2l1
