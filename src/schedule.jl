@@ -381,6 +381,19 @@ _fifo_name(i, c, num_cores) = num_cores == 1 ? "op$i" : "op$(i)_c$c"
 
 _retile(::Type{Tile{T, D}}, dims) where {T, D} = Tile{T, Tuple{dims...}}
 
+# The `dims_to_stream` pattern that rearranges a column-major `(m, k)` memtile tile into a
+# block-columnar L1 layout: each `r`x`s` matmul block laid out contiguously in column-major
+# order (matching the whole-tile `Mat` convention verified in matmul_tile.jl), blocks in
+# `(mb outer, kb inner)` order. The memtile holds element `(i, j)` at offset `j*m + i`, so the
+# nested read `mb, kb, c, rr` gives these `(size, stride)` pairs (outermost first). The L1
+# tile is then `Tile{T, (r*s, (m/r)*(k/s))}`, block `b` its `b`-th column.
+function _dims_to_stream_blocks(m::Int, k::Int, r::Int, s::Int)
+    (m % r == 0 && k % s == 0) || error(
+        "IRON: matmul block $(r)x$(s) does not tile a $(m)x$(k) operand tile"
+    )
+    return Tuple{Int, Int}[(m ÷ r, r), (k ÷ s, s * m), (s, m), (r, 1)]
+end
+
 # A single memtile can only fan out to (in from) one FIFO per core over its DMA channels,
 # so distribute/join partition the cores into groups of at most `L2_GROUP`, one memtile per
 # group. This matches the npu2 column shape (4 compute rows per memtile).
