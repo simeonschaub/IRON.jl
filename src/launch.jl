@@ -206,7 +206,6 @@ end
 function _build_tiled_program(
         @nospecialize(kernel), dirs, buffer_types, tile_types, device, name;
         depth::Integer = 2, stack_size::Integer = 1024, ctx::IR.Context = context(),
-        dims_to_stream = [Tuple{Int, Int}[] for _ in dirs],
     )
     nargs = length(dirs)
     grids = map(_tile_grid, buffer_types, tile_types)
@@ -230,7 +229,7 @@ function _build_tiled_program(
     for i in 1:nargs
         T = tile_types[i]
         prod, cons = dirs[i] === :in ? (shims[i], core_tile) : (core_tile, shims[i])
-        push!(device_body, objectfifo_op(ctx, "arg$i", prod, IR.Value[cons], objectfifo_type(ctx, T), depth; dims_to_stream = dims_to_stream[i]))
+        push!(device_body, objectfifo_op(ctx, "arg$i", prod, IR.Value[cons], objectfifo_type(ctx, T), depth))
         fifo = ObjectFifo{T}("arg$i")
         push!(endpoints, dirs[i] === :in ? consumer(fifo) : producer(fifo))
     end
@@ -258,7 +257,6 @@ function _iron_launch(
     flags::AbstractVector{<:AbstractString} = String[],
     verbose::Bool = false,
     stack_size::Integer = 1024,
-    dims_to_stream = [Tuple{Int, Int}[] for _ in args],
 )
     dirs = map(_dir, args)
     arrays = map(_array, args)
@@ -275,15 +273,12 @@ function _iron_launch(
         )
     end
 
-    key = (typeof(kernel), buffer_types, tile_types, dirs, device, String(name), Tuple(flags), Int(stack_size),
-           Tuple(Tuple(d) for d in dims_to_stream))
+    key = (typeof(kernel), buffer_types, tile_types, dirs, device, String(name), Tuple(flags), Int(stack_size))
     compiled = get!(_LAUNCH_CACHE, key) do
-        # A `dims_to_stream` (a MemTile/shim data-layout transform) needs the low-level tiled
-        # path, which drives the object FIFOs directly, even when a tile is the whole buffer.
-        if all(tile_types .=== buffer_types) && all(isempty, dims_to_stream)
+        if all(tile_types .=== buffer_types)
             compile(_build_program(kernel, dirs, arrays, device, name); flags, verbose)
         else
-            mlir = _build_tiled_program(kernel, dirs, buffer_types, tile_types, device, name; stack_size, dims_to_stream)
+            mlir = _build_tiled_program(kernel, dirs, buffer_types, tile_types, device, name; stack_size)
             compile(mlir, length(args); flags, verbose)
         end
     end
