@@ -69,19 +69,27 @@ function gemm_mm_acc!(
     return nothing
 end
 
-# The sub-tiled version: a `k=32` operand tile (KB=4 matmul k-blocks) streamed block-columnar
-# via `dims_to_stream`, so one DMA feeds four `vmatmul`s -- 4x fewer transfers than the
-# tiny-tile kernel above. Unrolled (a loop-carried vector PHI crashes Peano's AIE2P combiner).
+# The fully sub-tiled version: an 8x16 A tile / 16x4 B tile / 8x4 C tile, streamed
+# block-columnar via `dims_to_stream` in BOTH m and k, so one DMA feeds several `vmatmul`s and
+# one C transfer covers two output blocks. Unrolled (a loop-carried vector PHI crashes Peano).
+function gemm_mmt_zero!(c::Tile{Float32, Tuple{16, 2}})
+    z = zero(Vec{16, Float32})
+    vstore!(z, c, 1, 1)
+    vstore!(z, c, 1, 2)
+    return nothing
+end
 function gemm_mmt_acc!(
-        a::Tile{BFloat16, Tuple{32, 4}}, b::Tile{BFloat16, Tuple{32, 4}},
-        c::Tile{Float32, Tuple{4, 4}},
+        a::Tile{BFloat16, Tuple{32, 4}}, b::Tile{BFloat16, Tuple{32, 2}},
+        c::Tile{Float32, Tuple{16, 2}},
     )
-    acc = vload(Mat{4, 4, Float32}, c, 1, 1)
-    acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, 1), vload(Mat{8, 4, BFloat16}, b, 1, 1), acc)
-    acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, 2), vload(Mat{8, 4, BFloat16}, b, 1, 2), acc)
-    acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, 3), vload(Mat{8, 4, BFloat16}, b, 1, 3), acc)
-    acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, 4), vload(Mat{8, 4, BFloat16}, b, 1, 4), acc)
-    vstore!(acc, c, 1, 1)
+    acc0 = vload(Mat{4, 4, Float32}, c, 1, 1)
+    acc0 = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, 1), vload(Mat{8, 4, BFloat16}, b, 1, 1), acc0)
+    acc0 = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, 2), vload(Mat{8, 4, BFloat16}, b, 1, 2), acc0)
+    vstore!(acc0, c, 1, 1)
+    acc1 = vload(Mat{4, 4, Float32}, c, 1, 2)
+    acc1 = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, 3), vload(Mat{8, 4, BFloat16}, b, 1, 1), acc1)
+    acc1 = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, 4), vload(Mat{8, 4, BFloat16}, b, 1, 2), acc1)
+    vstore!(acc1, c, 1, 2)
     return nothing
 end
 
@@ -142,16 +150,16 @@ function gemm_launch_mm!(da, db, dc, M, K, N, m, k, n)
     return nothing
 end
 
-# Sub-tiled vmatmul: k=32 operand tiles streamed block-columnar (KB=4 matmul blocks/tile).
+# Sub-tiled vmatmul: 8x16/16x4 operand tiles + an 8x4 output tile, all block-columnar.
 function gemm_launch_mmt!(da, db, dc, M, K, N, m, k, n)
-    @iron stack_size = 3328 flags = AIECC_FLAGS for mi in 1:div(M, 4), nj in 1:div(N, 4)
+    @iron stack_size = 3328 flags = AIECC_FLAGS for mi in 1:div(M, 8), nj in 1:div(N, 4)
         @cores nj
-        @init gemm_mm_zero!(dc)
-        @reduce for kk in 1:div(K, 32)
+        @init gemm_mmt_zero!(dc)
+        @reduce for kk in 1:div(K, 16)
             gemm_mmt_acc!(
                 L2(In(da); blocks = (4, 8))[mi, kk],
                 L2(In(db); blocks = (8, 4))[kk, nj],
-                L2(Out(dc))[mi, nj],
+                L2(Out(dc); blocks = (4, 4))[mi, nj],
             )
         end
     end
