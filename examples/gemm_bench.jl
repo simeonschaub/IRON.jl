@@ -69,27 +69,27 @@ function gemm_mm_acc!(
     return nothing
 end
 
-# The fully sub-tiled version: an 8x16 A tile / 16x4 B tile / 8x4 C tile, streamed
-# block-columnar via `dims_to_stream` in BOTH m and k, so one DMA feeds several `vmatmul`s and
-# one C transfer covers two output blocks. Unrolled (a loop-carried vector PHI crashes Peano).
-function gemm_mmt_zero!(c::Tile{Float32, Tuple{16, 2}})
+# The fully sub-tiled version: an 8x16 A / 16x16 B / 8x16 C tile, streamed block-columnar via
+# `dims_to_stream` in m, k AND n, so one C DMA covers eight 4x4 output blocks and the tile is
+# scalar-sized (N/16 cores). Loop over the output blocks (acc is loop-local, so no PHI).
+function gemm_mmt_zero!(c::Tile{Float32, Tuple{16, 8}})
     z = zero(Vec{16, Float32})
-    vstore!(z, c, 1, 1)
-    vstore!(z, c, 1, 2)
+    for j in 1:8
+        vstore!(z, c, 1, j)
+    end
     return nothing
 end
 function gemm_mmt_acc!(
-        a::Tile{BFloat16, Tuple{32, 4}}, b::Tile{BFloat16, Tuple{32, 2}},
-        c::Tile{Float32, Tuple{16, 2}},
+        a::Tile{BFloat16, Tuple{32, 4}}, b::Tile{BFloat16, Tuple{32, 8}},
+        c::Tile{Float32, Tuple{16, 8}},
     )
-    acc0 = vload(Mat{4, 4, Float32}, c, 1, 1)
-    acc0 = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, 1), vload(Mat{8, 4, BFloat16}, b, 1, 1), acc0)
-    acc0 = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, 2), vload(Mat{8, 4, BFloat16}, b, 1, 2), acc0)
-    vstore!(acc0, c, 1, 1)
-    acc1 = vload(Mat{4, 4, Float32}, c, 1, 2)
-    acc1 = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, 3), vload(Mat{8, 4, BFloat16}, b, 1, 1), acc1)
-    acc1 = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, 4), vload(Mat{8, 4, BFloat16}, b, 1, 2), acc1)
-    vstore!(acc1, c, 1, 2)
+    for mb in 0:1, nb in 0:3
+        bi = mb * 4 + nb
+        acc = vload(Mat{4, 4, Float32}, c, 1, bi + 1)
+        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 2 + 1), vload(Mat{8, 4, BFloat16}, b, 1, nb + 1), acc)
+        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 2 + 2), vload(Mat{8, 4, BFloat16}, b, 1, 4 + nb + 1), acc)
+        vstore!(acc, c, 1, bi + 1)
+    end
     return nothing
 end
 
@@ -152,7 +152,7 @@ end
 
 # Sub-tiled vmatmul: 8x16/16x4 operand tiles + an 8x4 output tile, all block-columnar.
 function gemm_launch_mmt!(da, db, dc, M, K, N, m, k, n)
-    @iron stack_size = 3328 flags = AIECC_FLAGS for mi in 1:div(M, 8), nj in 1:div(N, 4)
+    @iron stack_size = 3328 flags = AIECC_FLAGS for mi in 1:div(M, 8), nj in 1:div(N, 16)
         @cores nj
         @init gemm_mmt_zero!(dc)
         @reduce for kk in 1:div(K, 16)
@@ -296,10 +296,10 @@ if get(ENV, "IRON_RUN", "0") == "1"
 
     # The `vmatmul` micro-kernel at three granularities, all on L2, same problem: scalar-
     # broadcast (16x32x16 tiles), tiny vmatmul (4x8x4, one matmul/tile), and sub-tiled vmatmul
-    # (k=32, KB=4 matmul blocks/tile via dims_to_stream, so one DMA feeds four matmuls). The
-    # tiny->tiled jump isolates the dims_to_stream payoff: fewer DMAs per matmul. (Output stays
-    # a 4x4 block, so N/4 cores; sub-tiling the output is the next step.) Small sizes only --
-    # the tiny output tiles inflate the instruction stream.
+    # (8x16x16 tile via dims_to_stream in m/k/n: 16 matmuls fed by one A/B DMA, one C DMA
+    # covering eight 4x4 blocks). The tiny->tiled jump isolates the dims_to_stream payoff. The
+    # sub-tiled output tile is now scalar-sized (8x16 -> N/16 cores), the fair comparison
+    # against scalar-broadcast. Small sizes only -- tiny output tiles inflate the stream.
     println()
     @printf("%-14s  %12s  %11s  %14s\n",
             "M=K x N", "scalar GF/s", "tiny GF/s", "sub-tiled GF/s")
@@ -313,7 +313,7 @@ if get(ENV, "IRON_RUN", "0") == "1"
             dc = NPUArray{Tacc}(undef, Tile{Tacc, Tuple{M, N}})
             sc = time_launch(gemm_launch_l2!, da, db, dc, a, b, M, K, N, 16, 32, 16; trials = 10)
             mm = time_launch(gemm_launch_mm!, da, db, dc, a, b, M, K, N, 4, 8, 4; trials = 10)
-            mt = time_launch(gemm_launch_mmt!, da, db, dc, a, b, M, K, N, 4, 32, 4; trials = 10)
+            mt = time_launch(gemm_launch_mmt!, da, db, dc, a, b, M, K, N, 8, 16, 16; trials = 10)
             @printf("%-14s  %12.2f  %11.2f  %14.2f\n",
                     "$(M)x$(K)x$(N)", sc.gflops, mm.gflops, mt.gflops)
         catch e
