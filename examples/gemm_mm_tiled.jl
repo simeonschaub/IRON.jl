@@ -30,12 +30,11 @@ function gemm_mm_tiled!(
         a::Tile{BFloat16, Tuple{32, KB}}, b::Tile{BFloat16, Tuple{32, KB}},
         c::Tile{Float32, Tuple{4, 4}},
     )
+    # Unrolled over the KB=2 matmul k-blocks: a loop-carried vector accumulator becomes a
+    # vector PHI that trips Peano's AIE2P pre-legalizer combiner, so keep it straight-line.
     acc = vload(Mat{4, 4, Float32}, c, 1, 1)
-    for kb in 1:KB
-        av = vload(Mat{4, 8, BFloat16}, a, 1, kb)
-        bv = vload(Mat{8, 4, BFloat16}, b, 1, kb)
-        acc = vmatmul(av, bv, acc)
-    end
+    acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, 1), vload(Mat{8, 4, BFloat16}, b, 1, 1), acc)
+    acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, 2), vload(Mat{8, 4, BFloat16}, b, 1, 2), acc)
     vstore!(acc, c, 1, 1)
     return nothing
 end
