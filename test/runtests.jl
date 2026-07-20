@@ -108,17 +108,16 @@ function gemm_acc!(
     return nothing
 end
 
-# One AIE2P matrix-multiply tile: 4x8 * 8x4 -> 4x4, accumulating in f32. Tiles are
-# column-major, so each `Tile{R,C}` loads as its `C`x`R` transpose and the product is
-# `bᵀ·aᵀ = (a·b)ᵀ`, which `c`'s transposed memref reads back as `a·b`.
+# One AIE2P matrix-multiply tile: 4x8 * 8x4 -> 4x4, accumulating in f32. `Mat{R,C}` is a
+# Julia RxC matrix and `vmatmul(a, b)` is `a * b` -- the column-major transpose is hidden.
 function mm_tile!(
         a::Tile{BFloat16, Tuple{4, 8}}, b::Tile{BFloat16, Tuple{8, 4}},
         c::Tile{Float32, Tuple{4, 4}},
     )
-    av = vload(Mat{8, 4, BFloat16}, a, 1, 1)
-    bv = vload(Mat{4, 8, BFloat16}, b, 1, 1)
+    av = vload(Mat{4, 8, BFloat16}, a, 1, 1)
+    bv = vload(Mat{8, 4, BFloat16}, b, 1, 1)
     acc = vload(Mat{4, 4, Float32}, c, 1, 1)
-    vstore!(vmatmul(bv, av, acc), c, 1, 1)
+    vstore!(vmatmul(av, bv, acc), c, 1, 1)
     return nothing
 end
 
