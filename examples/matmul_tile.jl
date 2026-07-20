@@ -17,10 +17,14 @@ function mm_tile!(
         a::Tile{BFloat16, Tuple{4, 8}}, b::Tile{BFloat16, Tuple{8, 4}},
         c::Tile{Float32, Tuple{4, 4}},
     )
-    av = vload(Mat{4, 8, BFloat16}, a, 1, 1)
-    bv = vload(Mat{8, 4, BFloat16}, b, 1, 1)
+    # Tiles are column-major, so a `Tile{R,C}` presents to the matmul unit as its `C`x`R`
+    # transpose. Load each operand at that register shape and multiply `bᵀ · aᵀ`, which is
+    # `(a·b)ᵀ` -- exactly the transpose `c`'s column-major memref already expects, so it
+    # reads back as `a·b`.
+    av = vload(Mat{8, 4, BFloat16}, a, 1, 1)   # aᵀ
+    bv = vload(Mat{4, 8, BFloat16}, b, 1, 1)   # bᵀ
     acc = vload(Mat{4, 4, Float32}, c, 1, 1)
-    vstore!(vmatmul(av, bv, acc), c, 1, 1)
+    vstore!(vmatmul(bv, av, acc), c, 1, 1)     # bᵀ·aᵀ = (a·b)ᵀ
     return nothing
 end
 
