@@ -48,6 +48,27 @@ function gemm_acc!(
     return nothing
 end
 
+# The hardware matmul-array micro-kernel (`vmatmul`), one 4x8*8x4->4x4 tile. Whole-tile
+# `Mat` loads only, so the object-FIFO tile is exactly one matmul (tiny) until
+# `dims_to_stream` lands.
+function gemm_mm_zero!(c::Tile{Float32, Tuple{4, 4}})
+    z = zero(Vec{4, Float32})
+    for j in 1:4
+        vstore!(z, c, 1, j)
+    end
+    return nothing
+end
+function gemm_mm_acc!(
+        a::Tile{BFloat16, Tuple{4, 8}}, b::Tile{BFloat16, Tuple{8, 4}},
+        c::Tile{Float32, Tuple{4, 4}},
+    )
+    av = vload(Mat{4, 8, BFloat16}, a, 1, 1)
+    bv = vload(Mat{8, 4, BFloat16}, b, 1, 1)
+    acc = vload(Mat{4, 4, Float32}, c, 1, 1)
+    vstore!(vmatmul(av, bv, acc), c, 1, 1)
+    return nothing
+end
+
 const AIECC_FLAGS = ["--alloc-scheme=basic-sequential"]
 const Tin, Tacc = BFloat16, Float32
 
@@ -87,6 +108,19 @@ function gemm_launch_l2!(da, db, dc, M, K, N, m, k, n)
         @init gemm_zero!(dc)
         @reduce for kk in 1:div(K, k)
             gemm_acc!(L2(In(da))[mi, kk], L2(In(db))[kk, nj], L2(Out(dc))[mi, nj])
+        end
+    end
+    return nothing
+end
+
+# The L2 GEMM with the hardware-matmul micro-kernel (`vmatmul`). Fixed 4x8x4 tiles, so the
+# core count is N/4 (m,k,n args ignored -- kept for the shared launch signature).
+function gemm_launch_mm!(da, db, dc, M, K, N, m, k, n)
+    @iron stack_size = 3328 flags = AIECC_FLAGS for mi in 1:div(M, 4), nj in 1:div(N, 4)
+        @cores nj
+        @init gemm_mm_zero!(dc)
+        @reduce for kk in 1:div(K, 8)
+            gemm_mm_acc!(L2(In(da))[mi, kk], L2(In(db))[kk, nj], L2(Out(dc))[mi, nj])
         end
     end
     return nothing
@@ -217,6 +251,31 @@ if get(ENV, "IRON_RUN", "0") == "1"
             end
         catch e
             @printf("%-14s  %5s  %s\n", "$(M)x$(K)x$(N)", "ERR", sprint(showerror, e))
+        end
+    end
+
+    # Hardware-matmul (`vmatmul`) micro-kernel vs the scalar-broadcast one, both on L2, same
+    # problem. vmatmul is stuck at 4x8x4 tiles (N/4 cores) until dims_to_stream allows
+    # sub-tiling, so the tiny tiles make it DMA/instruction-overhead-bound -- this is the
+    # starting point the layout work has to beat, not the eventual win. Small sizes only,
+    # since the tiny tiles blow up the instruction stream.
+    println()
+    @printf("%-14s  %8s  %14s  %8s  %14s\n",
+            "M=K x N", "s-cores", "scalar-L2 GF/s", "mm-cores", "vmatmul-L2 GF/s")
+    println("-"^68)
+    for (s, N) in [(128, 64), (256, 64)]
+        M = K = s
+        try
+            a = BFloat16[(i + j) % 7 for i in 1:M, j in 1:K]
+            b = BFloat16[(i - 2j) % 5 for i in 1:K, j in 1:N]
+            da, db = NPUArray(a), NPUArray(b)
+            dc = NPUArray{Tacc}(undef, Tile{Tacc, Tuple{M, N}})
+            sc = time_launch(gemm_launch_l2!, da, db, dc, a, b, M, K, N, 16, 32, 16; trials = 10)
+            mm = time_launch(gemm_launch_mm!, da, db, dc, a, b, M, K, N, 4, 8, 4; trials = 10)
+            @printf("%-14s  %8d  %14.2f  %8d  %14.2f\n",
+                    "$(M)x$(K)x$(N)", div(N, 16), sc.gflops, div(N, 4), mm.gflops)
+        catch e
+            @printf("%-14s  %8s  %s\n", "$(M)x$(K)x$(N)", "ERR", sprint(showerror, e))
         end
     end
 
