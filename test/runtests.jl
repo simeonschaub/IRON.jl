@@ -600,6 +600,31 @@ end
         @test_throws Exception IRON._parse_operand(:(L2(In(da); scatter)[mi, kk]))
     end
 
+    @testset "dims_to_stream block pattern" begin
+        # `_dims_to_stream_blocks` rearranges a column-major (m,k) tile into rxs blocks laid
+        # out contiguously column-major, blocks (mb outer, kb inner). Simulate the read and
+        # check it is that order and a permutation of the whole tile.
+        function apply(dims)
+            offs = Int[]
+            rec(i, base) = i > length(dims) ? push!(offs, base) :
+                for x in 0:(dims[i][1] - 1)
+                    rec(i + 1, base + x * dims[i][2])
+                end
+            rec(1, 0)
+            return offs
+        end
+        for (m, k, r, s) in [(16, 8, 4, 8), (16, 32, 4, 8), (4, 8, 4, 8)]
+            got = apply(IRON._dims_to_stream_blocks(m, k, r, s))
+            exp = Int[]
+            for mb in 0:(m ÷ r - 1), kb in 0:(k ÷ s - 1), c in 0:(s - 1), rr in 0:(r - 1)
+                push!(exp, (kb * s + c) * m + (mb * r + rr))
+            end
+            @test got == exp
+            @test sort(got) == collect(0:(m * k - 1))
+        end
+        @test_throws Exception IRON._dims_to_stream_blocks(6, 8, 4, 8)   # r does not tile m
+    end
+
     @testset "multi-core schedule module" begin
         # Build the operand specs the way `_schedule_launch` does (arrays are unused by
         # `_build_schedule_program`, so a placeholder suffices), then check the emitted
