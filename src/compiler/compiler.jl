@@ -196,7 +196,21 @@ function emit_vector!(kc::KernelContext, block::IR.Block, jblock, inst, fn, ops,
         # The element type is the first argument, a type rather than a value.
         tile = lookup!(kc, block, ops[2])
         indices = subscripts!(kc, block, tile, @view ops[3:end])
-        op = vector.load(tile, indices; result = result(), location = loc(ctx))
+        T = inst[:type]
+        if T <: Mat
+            # The AIE lowering does not handle a rank-2 `vector.load` (it scalarises into
+            # an unresolved `i64 -> index` cast), so read the R*C elements as a 1-D vector
+            # -- the supported path -- and `shape_cast` to the matrix shape.
+            R, C = size(T)
+            flat = vector.load(
+                tile, indices;
+                result = vector_type(ctx, Vec{R * C, eltype(T)}), location = loc(ctx),
+            )
+            push!(block, flat)
+            op = vector.shape_cast(IR.result(flat, 1); result = result(), location = loc(ctx))
+        else
+            op = vector.load(tile, indices; result = result(), location = loc(ctx))
+        end
         push!(block, op)
         kc.values[ssa] = IR.result(op, 1)
         return nothing
@@ -206,6 +220,16 @@ function emit_vector!(kc::KernelContext, block::IR.Block, jblock, inst, fn, ops,
         value = lookup!(kc, block, ops[1])
         tile = lookup!(kc, block, ops[2])
         indices = subscripts!(kc, block, tile, @view ops[3:end])
+        vt = IRStructurizer.value_type(jblock, ops[1])
+        if vt <: Mat
+            # Symmetric to the `Mat` load: flatten back to 1-D before the `vector.store`.
+            R, C = size(vt)
+            flat = vector.shape_cast(
+                value; result = vector_type(ctx, Vec{R * C, eltype(vt)}), location = loc(ctx),
+            )
+            push!(block, flat)
+            value = IR.result(flat, 1)
+        end
         push!(block, vector.store(value, tile, indices; location = loc(ctx)))
         return nothing
     end

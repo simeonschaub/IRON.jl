@@ -258,7 +258,10 @@ end
         @test occursin("vector<8x4xbf16>", ir)
         @test occursin("vector<4x4xf32>", ir)
         @test occursin("iterator_types", ir)
-        @test occursin("vector.load", ir)
+        # The 2-D tiles are loaded flat and shape_cast, since the AIE lowering has no
+        # rank-2 vector.load.
+        @test occursin("vector<32xbf16>", ir)
+        @test occursin("vector.shape_cast", ir)
     end
 
     @testset "unsupported kernels are rejected" begin
