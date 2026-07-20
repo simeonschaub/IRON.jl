@@ -589,13 +589,16 @@ end
     end
 
     @testset "L2 operand parsing" begin
-        # `L2(...)` wraps an operand for MemTile forwarding; the pattern is optional.
-        @test IRON._parse_operand(:(L2(In(da))[mi, kk])) == (:in, :da, [:mi, :kk], true, nothing)
-        @test IRON._parse_operand(:(L2(In(db); distribute)[kk, nj])) == (:in, :db, [:kk, :nj], true, :distribute)
-        @test IRON._parse_operand(:(L2(In(db), broadcast)[kk, nj])) == (:in, :db, [:kk, :nj], true, :broadcast)
-        @test IRON._parse_operand(:(L2(Out(dc); join)[mi, nj])) == (:out, :dc, [:mi, :nj], true, :join)
+        # `L2(...)` wraps an operand for MemTile forwarding; the pattern/blocks are optional.
+        @test IRON._parse_operand(:(L2(In(da))[mi, kk])) == (:in, :da, [:mi, :kk], true, nothing, nothing)
+        @test IRON._parse_operand(:(L2(In(db); distribute)[kk, nj])) == (:in, :db, [:kk, :nj], true, :distribute, nothing)
+        @test IRON._parse_operand(:(L2(In(db), broadcast)[kk, nj])) == (:in, :db, [:kk, :nj], true, :broadcast, nothing)
+        @test IRON._parse_operand(:(L2(Out(dc); join)[mi, nj])) == (:out, :dc, [:mi, :nj], true, :join, nothing)
+        # `blocks = (r, s)` gives the matmul-tile shape (an Expr passed through).
+        @test IRON._parse_operand(:(L2(In(da); blocks = (4, 8))[mi, kk])) == (:in, :da, [:mi, :kk], true, nothing, :((4, 8)))
+        @test IRON._parse_operand(:(L2(In(da); broadcast, blocks = (4, 8))[mi, kk])) == (:in, :da, [:mi, :kk], true, :broadcast, :((4, 8)))
         # Bare operands are unchanged.
-        @test IRON._parse_operand(:(In(da)[mi, kk])) == (:in, :da, [:mi, :kk], false, nothing)
+        @test IRON._parse_operand(:(In(da)[mi, kk])) == (:in, :da, [:mi, :kk], false, nothing, nothing)
         # An unknown pattern is rejected.
         @test_throws Exception IRON._parse_operand(:(L2(In(da); scatter)[mi, kk]))
     end
@@ -634,6 +637,7 @@ end
         spec(dir, T, buf, tl, ax, nm; l2 = nothing) = (
             dir = dir, array = nothing, access = ax, name = nm, l2pattern = l2,
             buffer_type = Tile{T, Tuple{buf...}}, tile_type = Tile{T, Tuple{tl...}},
+            core_type = Tile{T, Tuple{tl...}}, dims = Tuple{Int, Int}[],
         )
         specs = [
             spec(:in, BFloat16, (M, K), (m, k), [:mi, :kk], "op1"),

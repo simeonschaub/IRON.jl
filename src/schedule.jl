@@ -81,7 +81,7 @@ function _schedule_launch(
     # pattern -- explicit if given, else inferred from the access: an output joins, an
     # input indexed by a `@cores` axis distributes, one that is not broadcasts.
     specs = map(enumerate(operands)) do (i, op)
-        dir, arr, access, l2, pattern = op
+        dir, arr, access, l2, pattern, blocks = op
         bufdims = size(arr)
         length(access) == length(bufdims) || error(
             "IRON: operand $i has a $(length(bufdims))-D buffer but $(length(access)) access axes"
@@ -109,9 +109,23 @@ function _schedule_launch(
             pat
         end
         T = eltype(arr)
+        # `blocks = (r, s)` streams the DDR tile block-columnar so the kernel loads `Mat`
+        # sub-blocks contiguously: the core sees a `(r*s, num_blocks)` tile (each block a
+        # column), fed by a `dims_to_stream` off the memtile. Without it the core tile is the
+        # DDR tile and no transform is applied.
+        core_type, dims = if blocks === nothing
+            Tile{T, Tuple{tdims...}}, Tuple{Int, Int}[]
+        else
+            l2 || error("IRON: `blocks` needs `L2(...)` (the transform lives on a memtile)")
+            length(tdims) == 2 || error("IRON: `blocks` is only for 2-D operand tiles (op$i)")
+            r, s = Int(blocks[1]), Int(blocks[2])
+            nb = (tdims[1] ÷ r) * (tdims[2] ÷ s)
+            Tile{T, Tuple{r * s, nb}}, _dims_to_stream_blocks(tdims[1], tdims[2], r, s)
+        end
         (
             dir = dir, array = arr, access = acc, name = "op$i", l2pattern = l2pat,
             buffer_type = Tile{T, Tuple{bufdims...}}, tile_type = Tile{T, Tuple{tdims...}},
+            core_type = core_type, dims = dims,
         )
     end
 
@@ -172,7 +186,7 @@ function _schedule_launch(
         typeof(init), typeof(step),
         Tuple(s.buffer_type for s in specs), Tuple(s.tile_type for s in specs),
         Tuple(s.dir for s in specs), Tuple(Tuple(s.access) for s in specs),
-        Tuple(s.l2pattern for s in specs),
+        Tuple(s.l2pattern for s in specs), Tuple(s.core_type for s in specs), Tuple(Tuple(s.dims) for s in specs),
         Tuple(spatial), Tuple(temporal), Tuple(reduction), device, String(name), Tuple(flags), Int(stack_size),
     )
     compiled = get!(_LAUNCH_CACHE, key) do
@@ -207,16 +221,18 @@ function _emit_schedule_core!(ctx::IR.Context, @nospecialize(init), @nospecializ
 
     inputs = [s for s in specs if s.dir === :in]
     outputs = [s for s in specs if s.dir === :out]
-    output_types = Tuple{(s.tile_type for s in outputs)...}
-    all_types = Tuple{(s.tile_type for s in specs)...}
+    # The core sees each operand's `core_type` -- the block-columnar L1 tile for a `blocks`
+    # operand, the plain tile otherwise (they are equal without `blocks`).
+    output_types = Tuple{(s.core_type for s in outputs)...}
+    all_types = Tuple{(s.core_type for s in specs)...}
 
     # Outer (space) loop: one output tile per iteration.
     outer = IR.Block([index], [loc(ctx)])
     out_vals = IR.Value[]
     for s in outputs
-        acq = objectfifo_acquire_op(ctx, s.name, Produce, 1, objectfifo_subview_type(ctx, s.tile_type))
+        acq = objectfifo_acquire_op(ctx, s.name, Produce, 1, objectfifo_subview_type(ctx, s.core_type))
         push!(outer, acq)
-        acc = objectfifo_subview_access_op(ctx, IR.result(acq, 1), 0, memref_type(ctx, s.tile_type))
+        acc = objectfifo_subview_access_op(ctx, IR.result(acq, 1), 0, memref_type(ctx, s.core_type))
         push!(outer, acc)
         push!(out_vals, IR.result(acc, 1))
     end
@@ -227,9 +243,9 @@ function _emit_schedule_core!(ctx::IR.Context, @nospecialize(init), @nospecializ
     inner = IR.Block([index], [loc(ctx)])
     in_vals = IR.Value[]
     for s in inputs
-        acq = objectfifo_acquire_op(ctx, s.name, Consume, 1, objectfifo_subview_type(ctx, s.tile_type))
+        acq = objectfifo_acquire_op(ctx, s.name, Consume, 1, objectfifo_subview_type(ctx, s.core_type))
         push!(inner, acq)
-        acc = objectfifo_subview_access_op(ctx, IR.result(acq, 1), 0, memref_type(ctx, s.tile_type))
+        acc = objectfifo_subview_access_op(ctx, IR.result(acq, 1), 0, memref_type(ctx, s.core_type))
         push!(inner, acc)
         push!(in_vals, IR.result(acc, 1))
     end
@@ -500,7 +516,7 @@ function _build_schedule_program(
             mem_tile, shim_tile = IR.result(mem, 1), IR.result(shim, 1)
             push!(group_mems, mem_tile)
             for (i, s) in djspecs
-                tile_of = objectfifo_type(ctx, s.tile_type)
+                core_of = objectfifo_type(ctx, s.core_type)   # block-columnar for `blocks`
                 super_of = objectfifo_type(ctx, _retile(s.tile_type, _super_dims(s, core_names, gsize)))
                 offs = [_sub_offset(s, core_coords[c + 1], core_names, gsize, base) for c in group]
                 if s.l2pattern === :distribute
@@ -509,18 +525,18 @@ function _build_schedule_program(
                     outs = String[]
                     for c in group
                         l2l1 = "op$(i)_l2l1_c$(c)"
-                        push!(device_body, objectfifo_op(ctx, l2l1, mem_tile, IR.Value[core_tiles[c + 1]], tile_of, FIFO_DEPTH))
+                        push!(device_body, objectfifo_op(ctx, l2l1, mem_tile, IR.Value[core_tiles[c + 1]], core_of, FIFO_DEPTH; dims_to_stream = s.dims))
                         push!(outs, l2l1)
                         corefifo[c + 1][i] = l2l1
                     end
                     push!(device_body, objectfifo_link_op(ctx, [l3l2], outs; dst_offsets = offs))
-                else # :join
+                else # :join (output un-block via dims_to_stream on l2l3 is a later step; core_type is natural here)
                     l2l3 = "op$(i)_l2l3_g$(gidx - 1)"
                     push!(device_body, objectfifo_op(ctx, l2l3, mem_tile, IR.Value[shim_tile], super_of, FIFO_DEPTH))
                     ins = String[]
                     for c in group
                         l1l2 = "op$(i)_l1l2_c$(c)"
-                        push!(device_body, objectfifo_op(ctx, l1l2, core_tiles[c + 1], IR.Value[mem_tile], tile_of, FIFO_DEPTH))
+                        push!(device_body, objectfifo_op(ctx, l1l2, core_tiles[c + 1], IR.Value[mem_tile], core_of, FIFO_DEPTH))
                         push!(ins, l1l2)
                         corefifo[c + 1][i] = l1l2
                     end
@@ -536,6 +552,7 @@ function _build_schedule_program(
         for (i, s) in enumerate(specs)
             s.l2pattern === :broadcast || continue
             tile_of = objectfifo_type(ctx, s.tile_type)
+            core_of = objectfifo_type(ctx, s.core_type)
             shim = logical_tile_op(ctx, ShimNOCTile); push!(device_body, shim)
             mem_tile = if length(group_mems) + bcast_i < 8
                 mem = logical_tile_op(ctx, MemTile); push!(device_body, mem)
@@ -546,12 +563,10 @@ function _build_schedule_program(
             bcast_i += 1
             l3l2, l2l1 = "op$(i)_l3l2", "op$(i)_l2l1"
             push!(device_body, objectfifo_op(ctx, l3l2, IR.result(shim, 1), IR.Value[mem_tile], tile_of, FIFO_DEPTH))
-            # `dims_to_stream` on the memtile->core FIFO is the data-layout transform that
-            # will make matmul sub-tiles contiguous. An identity (whole tile, unit stride)
-            # is a no-op that proves it compiles on this MemTile producer -- the real
-            # block-columnar patterns replace it next.
-            l2l1_dims = Tuple{Int, Int}[(prod(size(s.tile_type)), 1)]
-            push!(device_body, objectfifo_op(ctx, l2l1, mem_tile, core_tiles, tile_of, FIFO_DEPTH; dims_to_stream = l2l1_dims))
+            # The l3l2 delivers the DDR tile to the memtile; `dims_to_stream` on the
+            # memtile->core l2l1 rearranges it into the block-columnar core layout (empty and
+            # so a plain relay when the operand has no `blocks`).
+            push!(device_body, objectfifo_op(ctx, l2l1, mem_tile, core_tiles, core_of, FIFO_DEPTH; dims_to_stream = s.dims))
             push!(device_body, objectfifo_link_op(ctx, [l3l2], [l2l1]))
             for c in 1:num_cores
                 corefifo[c][i] = l2l1
@@ -639,18 +654,24 @@ function _parse_operand(op)
     )
     callee, access = op.args[1], op.args[2:end]
 
-    # Peel an optional `L2(...)` wrapper, collecting an explicit pattern if given.
-    l2, pattern = false, nothing
+    # Peel an optional `L2(...)` wrapper, collecting an explicit pattern and/or a
+    # `blocks = (r, s)` matmul-tile shape (which streams the tile block-columnar via
+    # `dims_to_stream`, so a kernel can load `Mat{r,s}` sub-blocks contiguously).
+    l2, pattern, blocks = false, nothing, nothing
+    parse_param(p) =
+        if p isa Symbol && p in _L2_PATTERNS
+            pattern = p
+        elseif Meta.isexpr(p, :kw) && p.args[1] === :blocks
+            blocks = p.args[2]
+        else
+            error("@iron: `L2(...)` takes a pattern (broadcast/distribute/join) and/or \
+            `blocks = (r, s)`, got `$p`")
+        end
     if Meta.isexpr(callee, :call) && callee.args[1] === :L2
         l2 = true
         for a in callee.args[2:end]
-            if Meta.isexpr(a, :parameters)                 # `L2(In(a); broadcast)`
-                for p in a.args
-                    p in _L2_PATTERNS || error(
-                        "@iron: `L2(...)` pattern must be `broadcast`, `distribute` or `join`, got `$p`"
-                    )
-                    pattern = p
-                end
+            if Meta.isexpr(a, :parameters)                 # `L2(In(a); broadcast, blocks=(4,8))`
+                foreach(parse_param, a.args)
             elseif a in _L2_PATTERNS                        # `L2(In(a), broadcast)`
                 pattern = a
             elseif Meta.isexpr(a, :call) && a.args[1] in (:In, :Out)
@@ -666,7 +687,7 @@ function _parse_operand(op)
     all(a -> a isa Symbol, access) ||
         error("@iron: the `[...]` of a step argument must be axis names, got `$op`")
     dir = callee.args[1] === :In ? :in : :out
-    return (dir, callee.args[2], Symbol[access...], l2, pattern)
+    return (dir, callee.args[2], Symbol[access...], l2, pattern, blocks)
 end
 
 # The single step call inside a `@reduce for ... end` (or the space body, no reduction)
@@ -744,8 +765,9 @@ function _build_iron_schedule(forexpr, kws)
 
     ops_expr = Expr(:tuple, [
         Expr(:tuple, QuoteNode(dir), esc(arr), Expr(:tuple, QuoteNode.(access)...),
-             l2, pattern === nothing ? :nothing : QuoteNode(pattern))
-        for (dir, arr, access, l2, pattern) in operands
+             l2, pattern === nothing ? :nothing : QuoteNode(pattern),
+             blocks === nothing ? :nothing : esc(blocks))
+        for (dir, arr, access, l2, pattern, blocks) in operands
     ]...)
 
     # `@cores` becomes a `cores = (:axis, ...)` keyword on the launch call, alongside the
