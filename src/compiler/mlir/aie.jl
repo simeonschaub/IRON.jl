@@ -71,11 +71,23 @@ function logical_tile_op(ctx, tile_type::TileType)
     )
 end
 
-# `aie.objectfifo`: a circular buffer from one producer tile to one or more
-# consumer tiles.
+# One `#aie<bd_dim_layout_array[...]>` of `(size, stride)` pairs -- the AIE2 n-D buffer
+# descriptor access pattern, outermost dimension first, both in elements. Empty is a plain
+# contiguous transfer.
+function _bd_dim_layout(dims::AbstractVector{<:Tuple{Integer, Integer}})
+    isempty(dims) && return "#aie<bd_dim_layout_array[]>"
+    body = join(("<size = $s, stride = $t>" for (s, t) in dims), ", ")
+    return "#aie<bd_dim_layout_array[$body]>"
+end
+
+# `aie.objectfifo`: a circular buffer from one producer tile to one or more consumer tiles.
+# `dims_to_stream`, if given, is the `(size, stride)` access pattern the producer applies as
+# it writes to the stream -- the memtile data-layout transform that lets a core load matmul
+# sub-tiles contiguously.
 function objectfifo_op(
         ctx, sym_name::AbstractString, producer::IR.Value, consumers::Vector{IR.Value},
-        elem_type::IR.Type, depth::Integer,
+        elem_type::IR.Type, depth::Integer;
+        dims_to_stream::AbstractVector{<:Tuple{Integer, Integer}} = Tuple{Int, Int}[],
     )
     # `dimensionsFromStreamPerConsumer` carries one access-pattern list *per consumer*, so
     # a broadcast FIFO (several consumers) needs one empty entry each -- `[[], [], ...]`.
@@ -86,7 +98,7 @@ function objectfifo_op(
         operands = IR.Value[producer, consumers...],
         properties = [
             "dimensionsFromStreamPerConsumer" => opaque_attr(per_consumer; context = ctx),
-            "dimensionsToStream" => opaque_attr("#aie<bd_dim_layout_array[]>"; context = ctx),
+            "dimensionsToStream" => opaque_attr(_bd_dim_layout(dims_to_stream); context = ctx),
             "disable_synchronization" => IR.Attribute(false; context = ctx),
             "elemNumber" => i32(depth, ctx),
             "elemType" => IR.Attribute(elem_type),
