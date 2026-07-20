@@ -26,11 +26,14 @@ end
 """
     matrix_type(ctx, ::Type{Mat{R,C,T}}) -> IR.Type
 
-The rank-2 `vector<RxCxT>` a [`Mat`](@ref) lowers to.
+The rank-2 vector a [`Mat`](@ref) lowers to. A column-major `Tile{R,C}` presents to MLIR's
+row-major vectors as its transpose, so a Julia `R`x`C` matrix is a `vector<CxRxT>`. Keeping
+this transpose inside `Mat`/`vmatmul` (which loads at this shape and swaps its operands)
+lets a kernel stay Julia-natural -- write `R`x`C` and `a * b`, not the transposes.
 """
 function matrix_type(ctx::IR.Context, ::Type{Mat{R, C, T}}) where {R, C, T}
     return IR.Type(
-        API.mlirVectorTypeGet(2, Int64[R, C], mlir_eltype(ctx, T))
+        API.mlirVectorTypeGet(2, Int64[C, R], mlir_eltype(ctx, T))
     )
 end
 
@@ -314,14 +317,16 @@ function emit_vector!(kc::KernelContext, block::IR.Block, jblock, inst, fn, ops,
     end
 
     if fn === vmatmul
-        # The shaped hardware matmul, emitted as a `vector.contract` -- `C[m,n] += A[m,k] *
-        # B[k,n]` -- and left for `convert-vector-to-aievec` to lower to `aievec.matmul`
-        # (that pass also reconciles the surrounding casts, which emitting the aievec op by
-        # hand does not). The contraction is the standard `(m, n, k)` gemm: A indexed
-        # `(m, k)`, B `(k, n)`, the accumulator `(m, n)`, reducing over `k`.
+        # The shaped hardware matmul, emitted as a `vector.contract` and left for
+        # `convert-vector-to-aievec` to lower to `aievec.matmul` (that pass also reconciles
+        # the surrounding casts, which emitting the aievec op by hand does not). Each `Mat`
+        # is stored transposed (see `matrix_type`), so computing `a * b` in Julia means
+        # `contract(bᵀ, aᵀ) = (a*b)ᵀ`, which lands in the equally-transposed output tile --
+        # hence the operands are swapped here. The contraction is the standard `(m, n, k)`
+        # gemm: lhs indexed `(m, k)`, rhs `(k, n)`, accumulator `(m, n)`, reducing over `k`.
         a, b, c = (lookup!(kc, block, o) for o in ops)
         op = vector.contract(
-            a, b, c;
+            b, a, c;
             result_0 = result(),
             indexing_maps = opaque_attr(
                 "[affine_map<(d0, d1, d2) -> (d0, d2)>, \
