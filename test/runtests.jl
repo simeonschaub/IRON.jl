@@ -637,7 +637,7 @@ end
         spec(dir, T, buf, tl, ax, nm; l2 = nothing) = (
             dir = dir, array = nothing, access = ax, name = nm, l2pattern = l2,
             buffer_type = Tile{T, Tuple{buf...}}, tile_type = Tile{T, Tuple{tl...}},
-            core_type = Tile{T, Tuple{tl...}}, dims = Tuple{Int, Int}[],
+            core_type = Tile{T, Tuple{tl...}}, dims = Tuple{Int, Int}[], blocks = nothing,
         )
         specs = [
             spec(:in, BFloat16, (M, K), (m, k), [:mi, :kk], "op1"),
