@@ -69,6 +69,22 @@ function gemm_mm_acc!(
     return nothing
 end
 
+# The sub-tiled version: a `k=32` operand tile (KB=4 matmul k-blocks) streamed block-columnar
+# via `dims_to_stream`, so one DMA feeds four `vmatmul`s -- 4x fewer transfers than the
+# tiny-tile kernel above. Unrolled (a loop-carried vector PHI crashes Peano's AIE2P combiner).
+function gemm_mmt_acc!(
+        a::Tile{BFloat16, Tuple{32, 4}}, b::Tile{BFloat16, Tuple{32, 4}},
+        c::Tile{Float32, Tuple{4, 4}},
+    )
+    acc = vload(Mat{4, 4, Float32}, c, 1, 1)
+    acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, 1), vload(Mat{8, 4, BFloat16}, b, 1, 1), acc)
+    acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, 2), vload(Mat{8, 4, BFloat16}, b, 1, 2), acc)
+    acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, 3), vload(Mat{8, 4, BFloat16}, b, 1, 3), acc)
+    acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, 4), vload(Mat{8, 4, BFloat16}, b, 1, 4), acc)
+    vstore!(acc, c, 1, 1)
+    return nothing
+end
+
 const AIECC_FLAGS = ["--alloc-scheme=basic-sequential"]
 const Tin, Tacc = BFloat16, Float32
 
@@ -121,6 +137,22 @@ function gemm_launch_mm!(da, db, dc, M, K, N, m, k, n)
         @init gemm_mm_zero!(dc)
         @reduce for kk in 1:div(K, 8)
             gemm_mm_acc!(L2(In(da))[mi, kk], L2(In(db))[kk, nj], L2(Out(dc))[mi, nj])
+        end
+    end
+    return nothing
+end
+
+# Sub-tiled vmatmul: k=32 operand tiles streamed block-columnar (KB=4 matmul blocks/tile).
+function gemm_launch_mmt!(da, db, dc, M, K, N, m, k, n)
+    @iron stack_size = 3328 flags = AIECC_FLAGS for mi in 1:div(M, 4), nj in 1:div(N, 4)
+        @cores nj
+        @init gemm_mm_zero!(dc)
+        @reduce for kk in 1:div(K, 32)
+            gemm_mmt_acc!(
+                L2(In(da); blocks = (4, 8))[mi, kk],
+                L2(In(db); blocks = (8, 4))[kk, nj],
+                L2(Out(dc))[mi, nj],
+            )
         end
     end
     return nothing
@@ -254,15 +286,16 @@ if get(ENV, "IRON_RUN", "0") == "1"
         end
     end
 
-    # Hardware-matmul (`vmatmul`) micro-kernel vs the scalar-broadcast one, both on L2, same
-    # problem. vmatmul is stuck at 4x8x4 tiles (N/4 cores) until dims_to_stream allows
-    # sub-tiling, so the tiny tiles make it DMA/instruction-overhead-bound -- this is the
-    # starting point the layout work has to beat, not the eventual win. Small sizes only,
-    # since the tiny tiles blow up the instruction stream.
+    # The `vmatmul` micro-kernel at three granularities, all on L2, same problem: scalar-
+    # broadcast (16x32x16 tiles), tiny vmatmul (4x8x4, one matmul/tile), and sub-tiled vmatmul
+    # (k=32, KB=4 matmul blocks/tile via dims_to_stream, so one DMA feeds four matmuls). The
+    # tiny->tiled jump isolates the dims_to_stream payoff: fewer DMAs per matmul. (Output stays
+    # a 4x4 block, so N/4 cores; sub-tiling the output is the next step.) Small sizes only --
+    # the tiny output tiles inflate the instruction stream.
     println()
-    @printf("%-14s  %8s  %14s  %8s  %14s\n",
-            "M=K x N", "s-cores", "scalar-L2 GF/s", "mm-cores", "vmatmul-L2 GF/s")
-    println("-"^68)
+    @printf("%-14s  %12s  %11s  %14s\n",
+            "M=K x N", "scalar GF/s", "tiny GF/s", "sub-tiled GF/s")
+    println("-"^58)
     for (s, N) in [(128, 64), (256, 64)]
         M = K = s
         try
@@ -272,8 +305,9 @@ if get(ENV, "IRON_RUN", "0") == "1"
             dc = NPUArray{Tacc}(undef, Tile{Tacc, Tuple{M, N}})
             sc = time_launch(gemm_launch_l2!, da, db, dc, a, b, M, K, N, 16, 32, 16; trials = 10)
             mm = time_launch(gemm_launch_mm!, da, db, dc, a, b, M, K, N, 4, 8, 4; trials = 10)
-            @printf("%-14s  %8d  %14.2f  %8d  %14.2f\n",
-                    "$(M)x$(K)x$(N)", div(N, 16), sc.gflops, div(N, 4), mm.gflops)
+            mt = time_launch(gemm_launch_mmt!, da, db, dc, a, b, M, K, N, 4, 32, 4; trials = 10)
+            @printf("%-14s  %12.2f  %11.2f  %14.2f\n",
+                    "$(M)x$(K)x$(N)", sc.gflops, mm.gflops, mt.gflops)
         catch e
             @printf("%-14s  %8s  %s\n", "$(M)x$(K)x$(N)", "ERR", sprint(showerror, e))
         end
