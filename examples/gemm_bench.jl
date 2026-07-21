@@ -260,15 +260,15 @@ if get(ENV, "IRON_RUN", "0") == "1"
         end
     end
 
-    # Does routing operands through MemTiles (`L2(...)`) help, and does it scale with cores?
-    # Isolate its effect on *tall* GEMMs (large M·K, small N) where A dominates data movement:
-    # L2 broadcasts A once instead of re-reading it per core. N = 64/128/256 -> 4/8/16 cores
-    # (1/2/4 memtile groups). no-L2 caps at 8 cores (one shim per core), so the 16-core row is
-    # L2 only.
+    # Does the winning 16x32x16 `vmatmul` tile beat scalar-broadcast across the full L2 core
+    # array? Same L2 topology (A broadcasts, B distributes, C joins) and same core count
+    # (N/16) for both kernels, on *tall* GEMMs (large M·K, small N). N = 64/128/256/512 ->
+    # 4/8/16/32 cores (1/2/4/8 memtile groups). The vmatmul column drives the sub-tiled kernel
+    # through the same array -- its ratio over scalar-L2 is the whole-stack payoff at scale.
     println()
-    @printf("%-14s  %5s  %6s  %12s  %12s  %8s\n",
-            "M=K x N", "ok", "cores", "no-L2 GF/s", "L2 GF/s", "L2 gain")
-    println("-"^66)
+    @printf("%-14s  %5s  %6s  %13s  %13s  %10s\n",
+            "M=K x N", "ok", "cores", "L2 scalar GF/s", "L2 vmatmul GF/s", "vmm/scalar")
+    println("-"^70)
     # Default keeps the run short; IRON_BENCH_FULL=1 adds the 16- and 32-core designs, whose
     # large MLIR is slow to compile.
     tall = [(512, 64), (512, 128)]
@@ -282,15 +282,10 @@ if get(ENV, "IRON_RUN", "0") == "1"
             da, db = NPUArray(a), NPUArray(b)
             dc = NPUArray{Tacc}(undef, Tile{Tacc, Tuple{M, N}})
             l2 = time_launch(gemm_launch_l2!, da, db, dc, a, b, M, K, N, m, k, n; trials = 10)
-            if ncores <= MAX_CORES
-                nol2 = time_launch(gemm_launch_cores!, da, db, dc, a, b, M, K, N, m, k, n; trials = 10)
-                @printf("%-14s  %5s  %6d  %12.2f  %12.2f  %7.2fx\n",
-                        "$(M)x$(K)x$(N)", (nol2.ok && l2.ok) ? "yes" : "NO", ncores,
-                        nol2.gflops, l2.gflops, l2.gflops / nol2.gflops)
-            else
-                @printf("%-14s  %5s  %6d  %12s  %12.2f  %8s\n",
-                        "$(M)x$(K)x$(N)", l2.ok ? "yes" : "NO", ncores, "-", l2.gflops, "L2 only")
-            end
+            mt = time_launch(gemm_launch_mmt!, da, db, dc, a, b, M, K, N, m, k, n; trials = 10)
+            @printf("%-14s  %5s  %6d  %13.2f  %13.2f  %9.2fx\n",
+                    "$(M)x$(K)x$(N)", (l2.ok && mt.ok) ? "yes" : "NO", ncores,
+                    l2.gflops, mt.gflops, mt.gflops / l2.gflops)
         catch e
             @printf("%-14s  %5s  %s\n", "$(M)x$(K)x$(N)", "ERR", sprint(showerror, e))
         end
