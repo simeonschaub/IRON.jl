@@ -1,5 +1,5 @@
 # A GEMM whose micro-kernel is the hardware matmul (`vmatmul`), sub-tiled in m, k and n with a
-# BIG per-core output tile (64 x 16). Growing m (not n) keeps the core count at N/n -- so the
+# BIG per-core output tile (128 x 16). Growing m (not n) keeps the core count at N/n -- so the
 # full array stays busy -- while making each core process far fewer, larger tiles: that
 # amortizes the per-tile DMA/descriptor overhead that bounds the small-tile design, pushing the
 # core into the compute-bound regime where `vmatmul`'s 128-MAC/op density actually pays off.
@@ -7,33 +7,33 @@
 #
 #   IRON_RUN=1 julia --project examples/gemm_mm_tiled.jl
 #
-# Tiles: A = 64 x 64 (16 m-blocks x 8 k-blocks of 4x8), B = 64 x 16 (8 k-blocks x 4 n-blocks of
-# 8x4), C = 64 x 16 (16 m x 4 n blocks of 4x4). Block index orders: A (mb outer, kb inner) =
+# Tiles: A = 128 x 64 (32 m-blocks x 8 k-blocks of 4x8), B = 64 x 16 (8 k-blocks x 4 n-blocks of
+# 8x4), C = 128 x 16 (32 m x 4 n blocks of 4x4). Block index orders: A (mb outer, kb inner) =
 # mb*8+kb; B (kb outer, nb inner) = kb*4+nb; C (mb outer, nb inner) = mb*4+nb.
 
 using IRON
 using BFloat16s: BFloat16
 
-const M, K, N = 128, 128, 32
+const M, K, N = 256, 128, 32
 
-# Clear the block-columnar C core tile: 64 columns of 16 = the sixty-four 4x4 output blocks.
-function gemm_mm_zero!(c::Tile{Float32, Tuple{16, 64}})
+# Clear the block-columnar C core tile: 128 columns of 16 = the 128 4x4 output blocks.
+function gemm_mm_zero!(c::Tile{Float32, Tuple{16, 128}})
     z = zero(Vec{16, Float32})
-    for j in 1:64
+    for j in 1:128
         vstore!(z, c, 1, j)
     end
     return nothing
 end
 
-# `c += a * b`, fully looped: 16 m-blocks x 4 n-blocks x 8 k-blocks = 512 vmatmuls, all as loop
+# `c += a * b`, fully looped: 32 m-blocks x 4 n-blocks x 8 k-blocks = 1024 vmatmuls, all as loop
 # trips (no unrolled code). The k accumulation keeps the running 4x4 partial in the C tile
 # (load/accumulate/store per k-block), so nothing vector-valued is loop-carried -- sidestepping
 # the vector-PHI that crashes Peano's AIE2P combiner and letting the tile grow arbitrarily.
 function gemm_mm_tiled!(
-        a::Tile{BFloat16, Tuple{32, 128}}, b::Tile{BFloat16, Tuple{32, 32}},
-        c::Tile{Float32, Tuple{16, 64}},
+        a::Tile{BFloat16, Tuple{32, 256}}, b::Tile{BFloat16, Tuple{32, 32}},
+        c::Tile{Float32, Tuple{16, 128}},
     )
-    for mb in 0:15, nb in 0:3
+    for mb in 0:31, nb in 0:3
         bi = mb * 4 + nb
         for kb in 0:7
             acc = vload(Mat{4, 4, Float32}, c, 1, bi + 1)
@@ -52,7 +52,7 @@ if get(ENV, "IRON_RUN", "0") == "1"
     da, db = NPUArray(a), NPUArray(b)
     dc = NPUArray{Float32}(undef, Tile{Float32, Tuple{M, N}})
 
-    @iron stack_size = 3328 flags = AIECC_FLAGS for mi in 1:div(M, 64), nj in 1:div(N, 16)
+    @iron stack_size = 3328 flags = AIECC_FLAGS for mi in 1:div(M, 128), nj in 1:div(N, 16)
         @cores nj
         @init gemm_mm_zero!(dc)
         @reduce for kk in 1:div(K, 64)
@@ -67,7 +67,7 @@ if get(ENV, "IRON_RUN", "0") == "1"
     result = Array(dc)
     expected = Float32.(a) * Float32.(b)
     if result == expected
-        println("NPU vmatmul (big 64x16 tile) gemm ($(M)x$(K)x$(N), $(div(N, 16)) cores) matches")
+        println("NPU vmatmul (big 128x16 tile) gemm ($(M)x$(K)x$(N), $(div(N, 16)) cores) matches")
     else
         println("MISMATCH in $(count(result .!= expected)) of $(length(expected))")
     end
