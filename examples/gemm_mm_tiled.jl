@@ -23,21 +23,23 @@ function gemm_mm_zero!(c::Tile{Float32, Tuple{16, 16}})
     return nothing
 end
 
-# `c += a * b`. Loop over the 16 output blocks (acc is loaded/stored each iteration, never
-# loop-carried, so no vector PHI); the four k-blocks are unrolled (a loop-carried vector
-# accumulator PHI crashes Peano's AIE2P combiner).
+# `c += a * b`, fully looped -- 4 m-blocks x 4 n-blocks x 4 k-blocks. The k accumulation is a
+# LOOP (not hand-unrolled): each k-block loads the running 4x4 partial from the C tile,
+# accumulates one `vmatmul`, and stores it back, so the partial sum lives in the C memref
+# rather than a loop-carried vector register -- sidestepping the vector-PHI that crashes
+# Peano's AIE2P combiner. That makes the kernel size-generic: bigger tiles are just more loop
+# trips, not more unrolled code (the prerequisite for the big-tile / compute-bound regime).
 function gemm_mm_tiled!(
         a::Tile{BFloat16, Tuple{32, 16}}, b::Tile{BFloat16, Tuple{32, 16}},
         c::Tile{Float32, Tuple{16, 16}},
     )
     for mb in 0:3, nb in 0:3
         bi = mb * 4 + nb
-        acc = vload(Mat{4, 4, Float32}, c, 1, bi + 1)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 4 + 1), vload(Mat{8, 4, BFloat16}, b, 1, nb + 1), acc)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 4 + 2), vload(Mat{8, 4, BFloat16}, b, 1, 4 + nb + 1), acc)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 4 + 3), vload(Mat{8, 4, BFloat16}, b, 1, 8 + nb + 1), acc)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 4 + 4), vload(Mat{8, 4, BFloat16}, b, 1, 12 + nb + 1), acc)
-        vstore!(acc, c, 1, bi + 1)
+        for kb in 0:3
+            acc = vload(Mat{4, 4, Float32}, c, 1, bi + 1)
+            acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 4 + kb + 1), vload(Mat{8, 4, BFloat16}, b, 1, kb * 4 + nb + 1), acc)
+            vstore!(acc, c, 1, bi + 1)
+        end
     end
     return nothing
 end
