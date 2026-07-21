@@ -72,25 +72,24 @@ end
 # The fully sub-tiled version: an 8x16 A / 16x16 B / 8x16 C tile, streamed block-columnar via
 # `dims_to_stream` in m, k AND n, so one C DMA covers eight 4x4 output blocks and the tile is
 # scalar-sized (N/16 cores). Loop over the output blocks (acc is loop-local, so no PHI).
-function gemm_mmt_zero!(c::Tile{Float32, Tuple{16, 16}})
+function gemm_mmt_zero!(c::Tile{Float32, Tuple{16, 64}})
     z = zero(Vec{16, Float32})
-    for j in 1:16
+    for j in 1:64
         vstore!(z, c, 1, j)
     end
     return nothing
 end
 function gemm_mmt_acc!(
-        a::Tile{BFloat16, Tuple{32, 16}}, b::Tile{BFloat16, Tuple{32, 16}},
-        c::Tile{Float32, Tuple{16, 16}},
+        a::Tile{BFloat16, Tuple{32, 128}}, b::Tile{BFloat16, Tuple{32, 32}},
+        c::Tile{Float32, Tuple{16, 64}},
     )
-    for mb in 0:3, nb in 0:3
+    for mb in 0:15, nb in 0:3
         bi = mb * 4 + nb
-        acc = vload(Mat{4, 4, Float32}, c, 1, bi + 1)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 4 + 1), vload(Mat{8, 4, BFloat16}, b, 1, nb + 1), acc)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 4 + 2), vload(Mat{8, 4, BFloat16}, b, 1, 4 + nb + 1), acc)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 4 + 3), vload(Mat{8, 4, BFloat16}, b, 1, 8 + nb + 1), acc)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 4 + 4), vload(Mat{8, 4, BFloat16}, b, 1, 12 + nb + 1), acc)
-        vstore!(acc, c, 1, bi + 1)
+        for kb in 0:7
+            acc = vload(Mat{4, 4, Float32}, c, 1, bi + 1)
+            acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 8 + kb + 1), vload(Mat{8, 4, BFloat16}, b, 1, kb * 4 + nb + 1), acc)
+            vstore!(acc, c, 1, bi + 1)
+        end
     end
     return nothing
 end
@@ -152,12 +151,14 @@ function gemm_launch_mm!(da, db, dc, M, K, N, m, k, n)
     return nothing
 end
 
-# Sub-tiled vmatmul: 8x16/16x4 operand tiles + an 8x4 output tile, all block-columnar.
+# Big-tile sub-tiled vmatmul: 64x64 A / 64x16 B / 64x16 C operand tiles, all block-columnar,
+# with a looped (PHI-free) k accumulation. Grows m to 64 to amortize per-tile overhead while
+# holding n=16 so the core count (N/16) matches the scalar-L2 comparison.
 function gemm_launch_mmt!(da, db, dc, M, K, N, m, k, n)
-    @iron stack_size = 3328 flags = AIECC_FLAGS for mi in 1:div(M, 16), nj in 1:div(N, 16)
+    @iron stack_size = 3328 flags = AIECC_FLAGS for mi in 1:div(M, 64), nj in 1:div(N, 16)
         @cores nj
         @init gemm_mmt_zero!(dc)
-        @reduce for kk in 1:div(K, 32)
+        @reduce for kk in 1:div(K, 64)
             gemm_mmt_acc!(
                 L2(In(da); blocks = (4, 8))[mi, kk],
                 L2(In(db); blocks = (8, 4))[kk, nj],
@@ -292,11 +293,10 @@ if get(ENV, "IRON_RUN", "0") == "1"
     end
 
     # The `vmatmul` micro-kernel at three granularities, all on L2, same problem: scalar-
-    # broadcast (16x32x16 tiles), tiny vmatmul (4x8x4, one matmul/tile), and sub-tiled vmatmul
-    # (16x32x16 tile via dims_to_stream in m/k/n: 64 matmuls fed by one A/B DMA, one C DMA
-    # covering sixteen 4x4 blocks). The tiny->tiled jump isolates the dims_to_stream payoff.
-    # The sub-tiled tile now matches scalar's 16x16 output exactly (N/16 cores, same DMA), so
-    # the row is the fair MAC-array-vs-scalar test. Small sizes only.
+    # broadcast (16x32x16 tiles), tiny vmatmul (4x8x4, one matmul/tile), and the big-tile
+    # sub-tiled vmatmul (64x16 output via dims_to_stream in m/k/n, 512 matmuls/tile). The
+    # tiny->big span shows the full dims_to_stream + tile-amortization payoff at a fixed 4
+    # cores (N=64). Small sizes only -- the tiny column inflates the instruction stream.
     println()
     @printf("%-14s  %12s  %11s  %14s\n",
             "M=K x N", "scalar GF/s", "tiny GF/s", "sub-tiled GF/s")
