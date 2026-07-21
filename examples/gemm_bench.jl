@@ -69,23 +69,23 @@ function gemm_mm_acc!(
     return nothing
 end
 
-# The big-tile version: a 64x64 A / 64x16 B / 64x16 C tile, streamed block-columnar via
-# `dims_to_stream` in m, k AND n. Grows m to 64 (keeping n=16, so N/16 cores) so each core runs
-# 512 vmatmuls per tile and DMAs far fewer, larger tiles -- the amortization that makes the
+# The big-tile version: a 128x64 A / 64x16 B / 128x16 C tile, streamed block-columnar via
+# `dims_to_stream` in m, k AND n. Grows m to 128 (keeping n=16, so N/16 cores) so each core runs
+# 1024 vmatmuls per tile and DMAs far fewer, larger tiles -- the amortization that makes the
 # MAC-array kernel compute-bound. The k accumulation is a LOOP with the partial in the C tile
 # (load/accumulate/store per k-block), so nothing vector-valued is loop-carried (no Peano PHI).
-function gemm_mmt_zero!(c::Tile{Float32, Tuple{16, 64}})
+function gemm_mmt_zero!(c::Tile{Float32, Tuple{16, 128}})
     z = zero(Vec{16, Float32})
-    for j in 1:64
+    for j in 1:128
         vstore!(z, c, 1, j)
     end
     return nothing
 end
 function gemm_mmt_acc!(
-        a::Tile{BFloat16, Tuple{32, 128}}, b::Tile{BFloat16, Tuple{32, 32}},
-        c::Tile{Float32, Tuple{16, 64}},
+        a::Tile{BFloat16, Tuple{32, 256}}, b::Tile{BFloat16, Tuple{32, 32}},
+        c::Tile{Float32, Tuple{16, 128}},
     )
-    for mb in 0:15, nb in 0:3
+    for mb in 0:31, nb in 0:3
         bi = mb * 4 + nb
         for kb in 0:7
             acc = vload(Mat{4, 4, Float32}, c, 1, bi + 1)
@@ -153,11 +153,11 @@ function gemm_launch_mm!(da, db, dc, M, K, N, m, k, n)
     return nothing
 end
 
-# Big-tile sub-tiled vmatmul: 64x64 A / 64x16 B / 64x16 C operand tiles, all block-columnar,
-# with a looped (PHI-free) k accumulation. Grows m to 64 to amortize per-tile overhead while
+# Big-tile sub-tiled vmatmul: 128x64 A / 64x16 B / 128x16 C operand tiles, all block-columnar,
+# with a looped (PHI-free) k accumulation. Grows m to 128 to amortize per-tile overhead while
 # holding n=16 so the core count (N/16) matches the scalar-L2 comparison.
 function gemm_launch_mmt!(da, db, dc, M, K, N, m, k, n)
-    @iron stack_size = 3328 flags = AIECC_FLAGS for mi in 1:div(M, 64), nj in 1:div(N, 16)
+    @iron stack_size = 3328 flags = AIECC_FLAGS for mi in 1:div(M, 128), nj in 1:div(N, 16)
         @cores nj
         @init gemm_mmt_zero!(dc)
         @reduce for kk in 1:div(K, 64)
