@@ -39,10 +39,10 @@
 # which does not have a DMA channel per core to spare. Scaling to the full array needs the
 # L2/MemTile relay (a later increment), which fans out to the cores on-chip.
 
-# Object FIFO depth: how many tiles the shim may buffer ahead of the core. Also the
-# ceiling on in-flight host DMA buffer descriptors per operand (see
-# `_emit_schedule_runtime!`), which is why it must stay well under the 16-BD-per-tile
-# hardware limit.
+# Object FIFO depth: how many tiles the shim may buffer ahead of the core -- so it is also
+# the ping-pong / compute-DMA-overlap depth (>= 2 double-buffers each FIFO) and the ceiling
+# on in-flight host DMA buffer descriptors per operand (see `_emit_schedule_runtime!`), which
+# is why it must stay well under the 16-BD-per-tile hardware limit.
 const FIFO_DEPTH = 2
 
 # The launch behind the `for` form. `space`/`reduction` are tuples of `(name, extent)`;
@@ -325,73 +325,81 @@ function _emit_schedule_runtime!(ctx::IR.Context, specs, spatial, temporal, redu
     core_coords = _axis_coords(spatial)   # one spatial coordinate per core
     groups = _core_groups(num_cores)
 
-    for tc in _axis_coords(temporal)
-        # A sliding window of in-flight input BDs, one queue per FIFO -- per (operand, core)
-        # for direct inputs, per (operand, group) for the shared broadcast/distribute ones.
-        # The shim runs at most `FIFO_DEPTH` tiles ahead of a core before its object FIFO
-        # backpressures, so configuring more up front buys no overlap and just burns buffer
-        # descriptors (a tile holds at most 16). Await + free the oldest before the next.
-        inflight = Dict{Any, Vector{IR.Value}}()
-        for i in bcast_in
-            inflight[(:shared, i, 0)] = IR.Value[]
-        end
-        for i in dist_in, gidx in eachindex(groups)
-            inflight[(:shared, i, gidx)] = IR.Value[]
-        end
-        for i in direct_in, c in 0:(num_cores - 1)
-            inflight[(i, c)] = IR.Value[]
-        end
+    # Ping-pong / compute-DMA overlap. One sliding window of in-flight tasks per FIFO -- per
+    # (operand, core) for direct in/out, per (operand, group) for the shared broadcast/
+    # distribute/join ones -- carried ACROSS the temporal (output-tile) steps rather than
+    # drained at each one. A FIFO's oldest task is retired (await + free) only once
+    # `FIFO_DEPTH` newer ones are queued on it; the object FIFO backpressures the shim to at
+    # most `FIFO_DEPTH` tiles ahead, so by then the oldest has drained. Because the windows
+    # span tiles, one tile's output drain overlaps the next tile's input feed + compute
+    # instead of blocking it. Peak in-flight per FIFO stays `FIFO_DEPTH` (a tile holds at most
+    # 16 BDs), and the issue order per FIFO is unchanged -- only the await points move.
+    inflight = Dict{Any, Vector{IR.Value}}()
+    outflight = Dict{Any, Vector{IR.Value}}()
+    for i in bcast_in
+        inflight[(:shared, i, 0)] = IR.Value[]
+    end
+    for i in dist_in, gidx in eachindex(groups)
+        inflight[(:shared, i, gidx)] = IR.Value[]
+    end
+    for i in direct_in, c in 0:(num_cores - 1)
+        inflight[(i, c)] = IR.Value[]
+    end
+    for i in join_out, gidx in eachindex(groups)
+        outflight[(i, gidx)] = IR.Value[]
+    end
+    for i in direct_out, c in 0:(num_cores - 1)
+        outflight[(i, c)] = IR.Value[]
+    end
+    # Queue a task on its window, first retiring the oldest if the window is already full.
+    function window!(win, key, t)
+        q = win[key]
+        length(q) >= FIFO_DEPTH && retire(popfirst!(q))
+        push!(q, t)
+        return t
+    end
 
+    for tc in _axis_coords(temporal)
         # Advance the reduction in lockstep across the cores: feed *every* core its rc-th
-        # input tiles before moving to rc+1. The window's await then paces all cores
-        # together, so they compute concurrently -- feeding one core's whole reduction
-        # first would gate the next core on this core's progress and serialise them.
+        # input tiles before moving to rc+1, so they compute concurrently -- feeding one
+        # core's whole reduction first would gate the next core on this core's progress.
         for rc in _axis_coords(reduction)
             for i in bcast_in                       # shared tile, once for all cores
-                q = inflight[(:shared, i, 0)]
-                length(q) >= FIFO_DEPTH && retire(popfirst!(q))
-                push!(q, task(i, "op$(i)_l3l2", size(specs[i].tile_type), grid_of(specs[i], merge(tc, rc)); token = true))
+                window!(inflight, (:shared, i, 0), task(i, "op$(i)_l3l2", size(specs[i].tile_type), grid_of(specs[i], merge(tc, rc)); token = true))
             end
             for i in dist_in, (gidx, group) in enumerate(groups)   # a group's super-tile, sliced per core by the link
-                q = inflight[(:shared, i, gidx)]
-                length(q) >= FIFO_DEPTH && retire(popfirst!(q))
-                push!(q, task(i, "op$(i)_l3l2_g$(gidx - 1)", _super_dims(specs[i], core_names, length(group)), group_grid(specs[i], merge(tc, rc), gidx - 1); token = true))
+                window!(inflight, (:shared, i, gidx), task(i, "op$(i)_l3l2_g$(gidx - 1)", _super_dims(specs[i], core_names, length(group)), group_grid(specs[i], merge(tc, rc), gidx - 1); token = true))
             end
             for (c, sc) in enumerate(core_coords)
                 cidx = c - 1
                 full = merge(merge(sc, tc), rc)
                 for i in direct_in
-                    q = inflight[(i, cidx)]
-                    length(q) >= FIFO_DEPTH && retire(popfirst!(q))
-                    push!(q, task(i, _fifo_name(i, cidx, num_cores), size(specs[i].tile_type), grid_of(specs[i], full); token = true))
+                    window!(inflight, (i, cidx), task(i, _fifo_name(i, cidx, num_cores), size(specs[i].tile_type), grid_of(specs[i], full); token = true))
                 end
             end
         end
 
-        # Drain each core's output -- per core for direct outputs, per group as a super-tile
-        # for a join -- wait on them all, then retire the trailing inputs.
-        outs = IR.Value[]
+        # Start this tile's output drains on their own windows -- per core for direct outputs,
+        # per group as a super-tile for a join. They are awaited a couple of tiles later (via
+        # the sliding window / epilogue), so the drain overlaps the next tiles' feed + compute.
         for i in join_out, (gidx, group) in enumerate(groups)
-            push!(outs, task(i, "op$(i)_l2l3_g$(gidx - 1)", _super_dims(specs[i], core_names, length(group)), group_grid(specs[i], tc, gidx - 1); token = true))
+            window!(outflight, (i, gidx), task(i, "op$(i)_l2l3_g$(gidx - 1)", _super_dims(specs[i], core_names, length(group)), group_grid(specs[i], tc, gidx - 1); token = true))
         end
         for (c, sc) in enumerate(core_coords)
             cidx = c - 1
             for i in direct_out
-                push!(outs, task(i, _fifo_name(i, cidx, num_cores), size(specs[i].tile_type), grid_of(specs[i], merge(sc, tc)); token = true))
+                window!(outflight, (i, cidx), task(i, _fifo_name(i, cidx, num_cores), size(specs[i].tile_type), grid_of(specs[i], merge(sc, tc)); token = true))
             end
         end
-        for o in outs
-            push!(body, dma_await_task_op(ctx, o))
-        end
-        for i in bcast_in, t in inflight[(:shared, i, 0)]
-            retire(t)
-        end
-        for i in dist_in, gidx in eachindex(groups), t in inflight[(:shared, i, gidx)]
-            retire(t)
-        end
-        for c in 0:(num_cores - 1), i in direct_in, t in inflight[(i, c)]
-            retire(t)
-        end
+    end
+
+    # Epilogue: drain every task still in flight -- this awaits the tail output tiles the host
+    # reads back, so the sequence still completes only when the whole result is in DDR.
+    for q in values(inflight), t in q
+        retire(t)
+    end
+    for q in values(outflight), t in q
+        retire(t)
     end
     return runtime_sequence_op(ctx, "sequence", region(body))
 end
