@@ -72,22 +72,24 @@ end
 # The fully sub-tiled version: an 8x16 A / 16x16 B / 8x16 C tile, streamed block-columnar via
 # `dims_to_stream` in m, k AND n, so one C DMA covers eight 4x4 output blocks and the tile is
 # scalar-sized (N/16 cores). Loop over the output blocks (acc is loop-local, so no PHI).
-function gemm_mmt_zero!(c::Tile{Float32, Tuple{16, 8}})
+function gemm_mmt_zero!(c::Tile{Float32, Tuple{16, 16}})
     z = zero(Vec{16, Float32})
-    for j in 1:8
+    for j in 1:16
         vstore!(z, c, 1, j)
     end
     return nothing
 end
 function gemm_mmt_acc!(
-        a::Tile{BFloat16, Tuple{32, 4}}, b::Tile{BFloat16, Tuple{32, 8}},
-        c::Tile{Float32, Tuple{16, 8}},
+        a::Tile{BFloat16, Tuple{32, 16}}, b::Tile{BFloat16, Tuple{32, 16}},
+        c::Tile{Float32, Tuple{16, 16}},
     )
-    for mb in 0:1, nb in 0:3
+    for mb in 0:3, nb in 0:3
         bi = mb * 4 + nb
         acc = vload(Mat{4, 4, Float32}, c, 1, bi + 1)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 2 + 1), vload(Mat{8, 4, BFloat16}, b, 1, nb + 1), acc)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 2 + 2), vload(Mat{8, 4, BFloat16}, b, 1, 4 + nb + 1), acc)
+        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 4 + 1), vload(Mat{8, 4, BFloat16}, b, 1, nb + 1), acc)
+        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 4 + 2), vload(Mat{8, 4, BFloat16}, b, 1, 4 + nb + 1), acc)
+        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 4 + 3), vload(Mat{8, 4, BFloat16}, b, 1, 8 + nb + 1), acc)
+        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 4 + 4), vload(Mat{8, 4, BFloat16}, b, 1, 12 + nb + 1), acc)
         vstore!(acc, c, 1, bi + 1)
     end
     return nothing
@@ -152,10 +154,10 @@ end
 
 # Sub-tiled vmatmul: 8x16/16x4 operand tiles + an 8x4 output tile, all block-columnar.
 function gemm_launch_mmt!(da, db, dc, M, K, N, m, k, n)
-    @iron stack_size = 3328 flags = AIECC_FLAGS for mi in 1:div(M, 8), nj in 1:div(N, 16)
+    @iron stack_size = 3328 flags = AIECC_FLAGS for mi in 1:div(M, 16), nj in 1:div(N, 16)
         @cores nj
         @init gemm_mmt_zero!(dc)
-        @reduce for kk in 1:div(K, 16)
+        @reduce for kk in 1:div(K, 32)
             gemm_mmt_acc!(
                 L2(In(da); blocks = (4, 8))[mi, kk],
                 L2(In(db); blocks = (8, 4))[kk, nj],
@@ -296,10 +298,10 @@ if get(ENV, "IRON_RUN", "0") == "1"
 
     # The `vmatmul` micro-kernel at three granularities, all on L2, same problem: scalar-
     # broadcast (16x32x16 tiles), tiny vmatmul (4x8x4, one matmul/tile), and sub-tiled vmatmul
-    # (8x16x16 tile via dims_to_stream in m/k/n: 16 matmuls fed by one A/B DMA, one C DMA
-    # covering eight 4x4 blocks). The tiny->tiled jump isolates the dims_to_stream payoff. The
-    # sub-tiled output tile is now scalar-sized (8x16 -> N/16 cores), the fair comparison
-    # against scalar-broadcast. Small sizes only -- tiny output tiles inflate the stream.
+    # (16x32x16 tile via dims_to_stream in m/k/n: 64 matmuls fed by one A/B DMA, one C DMA
+    # covering sixteen 4x4 blocks). The tiny->tiled jump isolates the dims_to_stream payoff.
+    # The sub-tiled tile now matches scalar's 16x16 output exactly (N/16 cores, same DMA), so
+    # the row is the fair MAC-array-vs-scalar test. Small sizes only.
     println()
     @printf("%-14s  %12s  %11s  %14s\n",
             "M=K x N", "scalar GF/s", "tiny GF/s", "sub-tiled GF/s")
@@ -313,7 +315,7 @@ if get(ENV, "IRON_RUN", "0") == "1"
             dc = NPUArray{Tacc}(undef, Tile{Tacc, Tuple{M, N}})
             sc = time_launch(gemm_launch_l2!, da, db, dc, a, b, M, K, N, 16, 32, 16; trials = 10)
             mm = time_launch(gemm_launch_mm!, da, db, dc, a, b, M, K, N, 4, 8, 4; trials = 10)
-            mt = time_launch(gemm_launch_mmt!, da, db, dc, a, b, M, K, N, 8, 16, 16; trials = 10)
+            mt = time_launch(gemm_launch_mmt!, da, db, dc, a, b, M, K, N, 16, 32, 16; trials = 10)
             @printf("%-14s  %12.2f  %11.2f  %14.2f\n",
                     "$(M)x$(K)x$(N)", sc.gflops, mm.gflops, mt.gflops)
         catch e
