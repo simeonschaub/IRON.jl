@@ -69,9 +69,11 @@ function gemm_mm_acc!(
     return nothing
 end
 
-# The fully sub-tiled version: an 8x16 A / 16x16 B / 8x16 C tile, streamed block-columnar via
-# `dims_to_stream` in m, k AND n, so one C DMA covers eight 4x4 output blocks and the tile is
-# scalar-sized (N/16 cores). Loop over the output blocks (acc is loop-local, so no PHI).
+# The big-tile version: a 64x64 A / 64x16 B / 64x16 C tile, streamed block-columnar via
+# `dims_to_stream` in m, k AND n. Grows m to 64 (keeping n=16, so N/16 cores) so each core runs
+# 512 vmatmuls per tile and DMAs far fewer, larger tiles -- the amortization that makes the
+# MAC-array kernel compute-bound. The k accumulation is a LOOP with the partial in the C tile
+# (load/accumulate/store per k-block), so nothing vector-valued is loop-carried (no Peano PHI).
 function gemm_mmt_zero!(c::Tile{Float32, Tuple{16, 64}})
     z = zero(Vec{16, Float32})
     for j in 1:64
@@ -232,34 +234,34 @@ end
 if get(ENV, "IRON_RUN", "0") == "1"
     sizes = [128, 512]      # 128 -> 8 cores (the multi-core point); 512 -> single-core ceiling
 
-    @printf("%-12s  %5s  %11s  %6s  %11s  %8s  %10s\n",
-            "M=K=N", "ok", "1-core GF/s", "cores", "N-core GF/s", "speedup", "host BLAS")
-    println("-"^76)
-    for s in sizes
-        try
-            r = bench_size(s, s, s)
-            hg = bench_host(s, s, s)
-            if r.multi.ok
-                @printf("%-12s  %5s  %11.2f  %6d  %11.2f  %7.2fx  %10.1f\n",
-                        "$(s)³", r.single.ok ? "yes" : "NO",
-                        r.single.gflops, r.ncores, r.multi.gflops,
-                        r.multi.gflops / r.single.gflops, hg)
-            else
-                # Multi-core did not run (over the core budget, or a compile/mismatch);
-                # still report the single-core number and why the parallel one is absent.
-                @printf("%-12s  %5s  %11.2f  %6d  %11s  %8s  %10.1f\n",
-                        "$(s)³", r.single.ok ? "yes" : "NO",
-                        r.single.gflops, r.ncores, "-", "-", hg)
-                @printf("       ^ %d-core: %s\n", r.ncores, get(r.multi, :err, "mismatch"))
-            end
-        catch e
-            # A size can fail to *compile* rather than mis-compute -- e.g. a long reduction
-            # that overruns the shim's buffer-descriptor budget. Report it and keep going.
-            msg = sprint(showerror, e)
-            note = occursin("buffer descriptors", msg) ? "shim BD limit" : "compile/run failed"
-            @printf("%-12s  %5s  %s\n", "$(s)³", "ERR", note)
-        end
-    end
+    #@printf("%-12s  %5s  %11s  %6s  %11s  %8s  %10s\n",
+    #        "M=K=N", "ok", "1-core GF/s", "cores", "N-core GF/s", "speedup", "host BLAS")
+    #println("-"^76)
+    #for s in sizes
+    #    try
+    #        r = bench_size(s, s, s)
+    #        hg = bench_host(s, s, s)
+    #        if r.multi.ok
+    #            @printf("%-12s  %5s  %11.2f  %6d  %11.2f  %7.2fx  %10.1f\n",
+    #                    "$(s)³", r.single.ok ? "yes" : "NO",
+    #                    r.single.gflops, r.ncores, r.multi.gflops,
+    #                    r.multi.gflops / r.single.gflops, hg)
+    #        else
+    #            # Multi-core did not run (over the core budget, or a compile/mismatch);
+    #            # still report the single-core number and why the parallel one is absent.
+    #            @printf("%-12s  %5s  %11.2f  %6d  %11s  %8s  %10.1f\n",
+    #                    "$(s)³", r.single.ok ? "yes" : "NO",
+    #                    r.single.gflops, r.ncores, "-", "-", hg)
+    #            @printf("       ^ %d-core: %s\n", r.ncores, get(r.multi, :err, "mismatch"))
+    #        end
+    #    catch e
+    #        # A size can fail to *compile* rather than mis-compute -- e.g. a long reduction
+    #        # that overruns the shim's buffer-descriptor budget. Report it and keep going.
+    #        msg = sprint(showerror, e)
+    #        note = occursin("buffer descriptors", msg) ? "shim BD limit" : "compile/run failed"
+    #        @printf("%-12s  %5s  %s\n", "$(s)³", "ERR", note)
+    #    end
+    #end
 
     # Does the winning 16x32x16 `vmatmul` tile beat scalar-broadcast across the full L2 core
     # array? Same L2 topology (A broadcasts, B distributes, C joins) and same core count
