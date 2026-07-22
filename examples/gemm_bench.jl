@@ -343,6 +343,35 @@ if get(ENV, "IRON_RUN", "0") == "1"
         end
     end
 
+    # Large-matrix scaling at the full 32-core array (N=512). Grow M=K to test whether the
+    # ~60 GOP/s 32-core wall is fixed per-launch/per-tile overhead (throughput keeps climbing
+    # with size) or a shared memtile/DDR resource (plateaus). int8 is the headline number to
+    # hold against AMD's ~50 TOPS (int8). GF/s = GOP/s = 2*M*N*K/min-time, end to end.
+    if get(ENV, "IRON_BENCH_LARGE", "0") == "1"
+        println()
+        @printf("%-16s  %5s  %6s  %13s  %13s\n", "M=K x N", "ok", "cores", "bf16 GOP/s", "int8 GOP/s")
+        println("-"^64)
+        for s in (512, 1024, 2048, 4096)
+            M = K = s; N = 512; m, k, n = 16, 32, 16       # 32 cores
+            try
+                a = BFloat16[(i + j) % 7 for i in 1:M, j in 1:K]
+                b = BFloat16[(i - 2j) % 5 for i in 1:K, j in 1:N]
+                da, db = NPUArray(a), NPUArray(b)
+                dc = NPUArray{Tacc}(undef, Tile{Tacc, Tuple{M, N}})
+                mt = time_launch(gemm_launch_mmt!, da, db, dc, a, b, M, K, N, m, k, n; trials = 6)
+                ai = Int8[(i + j) % 7 for i in 1:M, j in 1:K]
+                bi = Int8[(i - 2j) % 5 for i in 1:K, j in 1:N]
+                dai, dbi = NPUArray(ai), NPUArray(bi)
+                dci = NPUArray{Int32}(undef, Tile{Int32, Tuple{M, N}})
+                i8 = time_launch(gemm_launch_i8!, dai, dbi, dci, ai, bi, M, K, N, m, k, n; trials = 6)
+                @printf("%-16s  %5s  %6d  %13.2f  %13.2f\n", "$(M)x$(K)x$(N)",
+                        (mt.ok && i8.ok) ? "yes" : "NO", div(N, 16), mt.gflops, i8.gflops)
+            catch e
+                @printf("%-16s  %5s  %s\n", "$(M)x$(K)x$(N)", "ERR", sprint(showerror, e))
+            end
+        end
+    end
+
     # The `vmatmul` micro-kernel at three granularities, all on L2, same problem: scalar-
     # broadcast (16x32x16 tiles), tiny vmatmul (4x8x4, one matmul/tile), and the big-tile
     # sub-tiled vmatmul (64x16 output via dims_to_stream in m/k/n, 512 matmuls/tile). The
