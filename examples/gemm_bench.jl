@@ -72,8 +72,8 @@ end
 # The big-tile version: a 128x64 A / 64x16 B / 128x16 C tile, streamed block-columnar via
 # `dims_to_stream` in m, k AND n. Grows m to 128 (keeping n=16, so N/16 cores) so each core runs
 # 1024 vmatmuls per tile and DMAs far fewer, larger tiles -- the amortization that makes the
-# MAC-array kernel compute-bound. Loops the 128 output blocks but unrolls the 8 k-blocks
-# straight-line (partial held in a register, C loaded/stored once per output block, no Peano PHI).
+# MAC-array kernel compute-bound. The k accumulation is a LOOP with the partial in the C tile
+# (load/accumulate/store per k-block), so nothing vector-valued is loop-carried (no Peano PHI).
 function gemm_mmt_zero!(c::Tile{Float32, Tuple{16, 128}})
     z = zero(Vec{16, Float32})
     for j in 1:128
@@ -87,16 +87,11 @@ function gemm_mmt_acc!(
     )
     for mb in 0:31, nb in 0:3
         bi = mb * 4 + nb
-        acc = vload(Mat{4, 4, Float32}, c, 1, bi + 1)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 8 + 1), vload(Mat{8, 4, BFloat16}, b, 1, nb + 1), acc)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 8 + 2), vload(Mat{8, 4, BFloat16}, b, 1, 4 + nb + 1), acc)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 8 + 3), vload(Mat{8, 4, BFloat16}, b, 1, 8 + nb + 1), acc)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 8 + 4), vload(Mat{8, 4, BFloat16}, b, 1, 12 + nb + 1), acc)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 8 + 5), vload(Mat{8, 4, BFloat16}, b, 1, 16 + nb + 1), acc)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 8 + 6), vload(Mat{8, 4, BFloat16}, b, 1, 20 + nb + 1), acc)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 8 + 7), vload(Mat{8, 4, BFloat16}, b, 1, 24 + nb + 1), acc)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 8 + 8), vload(Mat{8, 4, BFloat16}, b, 1, 28 + nb + 1), acc)
-        vstore!(acc, c, 1, bi + 1)
+        for kb in 0:7
+            acc = vload(Mat{4, 4, Float32}, c, 1, bi + 1)
+            acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 8 + kb + 1), vload(Mat{8, 4, BFloat16}, b, 1, kb * 4 + nb + 1), acc)
+            vstore!(acc, c, 1, bi + 1)
+        end
     end
     return nothing
 end
