@@ -25,28 +25,21 @@ function gemm_mm_zero!(c::Tile{Float32, Tuple{16, 128}})
     return nothing
 end
 
-# `c += a * b`: LOOP the 128 output blocks (32 m x 4 n), each an independent 4x4 C location, but
-# UNROLL the 8 k-blocks straight-line -- the partial `acc` is held in a register across the k
-# chain (loaded once, stored once per output block, not per k-block), so C L1 traffic drops 8x.
-# Straight-line SSA has no loop-carried vector value, so no PHI for Peano's AIE2P combiner (the
-# crash is specific to an scf.for vector iter-arg, which we still avoid -- the output loop's
-# `acc` never crosses an iteration). Block indices: A mb*8+kb, B kb*4+nb, C mb*4+nb.
+# `c += a * b`, fully looped: 32 m-blocks x 4 n-blocks x 8 k-blocks = 1024 vmatmuls, all as loop
+# trips (no unrolled code). The k accumulation keeps the running 4x4 partial in the C tile
+# (load/accumulate/store per k-block), so nothing vector-valued is loop-carried -- sidestepping
+# the vector-PHI that crashes Peano's AIE2P combiner and letting the tile grow arbitrarily.
 function gemm_mm_tiled!(
         a::Tile{BFloat16, Tuple{32, 256}}, b::Tile{BFloat16, Tuple{32, 32}},
         c::Tile{Float32, Tuple{16, 128}},
     )
     for mb in 0:31, nb in 0:3
         bi = mb * 4 + nb
-        acc = vload(Mat{4, 4, Float32}, c, 1, bi + 1)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 8 + 1), vload(Mat{8, 4, BFloat16}, b, 1, nb + 1), acc)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 8 + 2), vload(Mat{8, 4, BFloat16}, b, 1, 4 + nb + 1), acc)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 8 + 3), vload(Mat{8, 4, BFloat16}, b, 1, 8 + nb + 1), acc)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 8 + 4), vload(Mat{8, 4, BFloat16}, b, 1, 12 + nb + 1), acc)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 8 + 5), vload(Mat{8, 4, BFloat16}, b, 1, 16 + nb + 1), acc)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 8 + 6), vload(Mat{8, 4, BFloat16}, b, 1, 20 + nb + 1), acc)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 8 + 7), vload(Mat{8, 4, BFloat16}, b, 1, 24 + nb + 1), acc)
-        acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 8 + 8), vload(Mat{8, 4, BFloat16}, b, 1, 28 + nb + 1), acc)
-        vstore!(acc, c, 1, bi + 1)
+        for kb in 0:7
+            acc = vload(Mat{4, 4, Float32}, c, 1, bi + 1)
+            acc = vmatmul(vload(Mat{4, 8, BFloat16}, a, 1, mb * 8 + kb + 1), vload(Mat{8, 4, BFloat16}, b, 1, kb * 4 + nb + 1), acc)
+            vstore!(acc, c, 1, bi + 1)
+        end
     end
     return nothing
 end
