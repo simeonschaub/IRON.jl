@@ -8,7 +8,7 @@
 #     `aie-translate`). `aiecc` orchestrates the full lowering, links bootgen for
 #     PDI generation, and packages the xclbin -- everything the Python `aiecc.py`
 #     did, in one executable.
-#   * `Peano_jll` ships the AIE LLVM fork (`clang`/`lld`/`llc`/`opt`) that `aiecc`
+#   * `AIE_LLVM_Backend_jll` ships the AIE LLVM fork (`clang`/`lld`/`llc`/`opt`) that `aiecc`
 #     shells out to for per-core code generation. It is handed to `aiecc` via
 #     `--peano=<dir>` rather than the chess/xchesscc path (which needs the
 #     proprietary Vitis toolchain we do not have).
@@ -32,9 +32,9 @@ stream (`insts`, a little-endian `UInt32` blob), returning the two paths.
 runtime opens. Intermediate build products land in `workdir`.
 
 `peano` is the Peano/llvm-aie install `aiecc` shells out to for per-core code
-generation and linking; it defaults to `Peano_jll`. Override it to point at
+generation and linking; it defaults to `AIE_LLVM_Backend_jll`. Override it to point at
 another llvm-aie (e.g. one whose AIE bare-metal runtimes -- `libclang_rt.builtins.a`,
-`crt0.o`/`crt1.o`, `libc.a`/`libm.a` -- are present, which `Peano_jll` does not
+`crt0.o`/`crt1.o`, `libc.a`/`libm.a` -- are present, which `AIE_LLVM_Backend_jll` does not
 yet ship).
 
 `flags` are passed through to `aiecc` verbatim; the one worth knowing is
@@ -46,7 +46,7 @@ function aiecc_compile(
     workdir::AbstractString = mktempdir(),
     xclbin::AbstractString = joinpath(workdir, "design.xclbin"),
     insts::AbstractString = joinpath(workdir, "insts.bin"),
-    peano::AbstractString = Peano_jll.artifact_dir,
+    peano::AbstractString = AIE_LLVM_Backend_jll.artifact_dir,
     flags::AbstractVector{<:AbstractString} = String[],
     verbose::Bool = false,
 )

@@ -40,10 +40,7 @@ using IRStructurizer
 using Adapt: Adapt, adapt
 using GPUArraysCore: GPUArraysCore, AbstractGPUArray, @allowscalar
 
-# The AIE toolchain, shipped as JLL artifacts. `using` these never fails when an
-# artifact is missing -- only *calling* a product (aiecc, the shim library) does,
-# which is what compiling and running a design need but generating MLIR does not.
-using Peano_jll: Peano_jll
+import AIE_LLVM_Backend_jll
 using mlir_aie_jll: aiecc
 using ironxrt_jll: libironxrt
 using xrt_jll: xrt_jll
