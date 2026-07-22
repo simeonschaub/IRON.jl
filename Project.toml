@@ -4,11 +4,11 @@ version = "1.0.0-DEV"
 authors = ["Simeon David Schaub <simeon@schaub.rocks> and contributors"]
 
 [deps]
+AIE_LLVM_Backend_jll = "37145a88-5c43-5b67-ab3c-d118b6116073"
 Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
 GPUArraysCore = "46192b85-c4d5-4398-a991-12ede77f4527"
 IRStructurizer = "93e32bba-5bb8-402b-805d-ffb066edee93"
 MLIR = "bfde9dd4-8f40-4a1e-be09-1475335e1c92"
-Peano_jll = "7666bd74-b3e7-5b20-876b-cf50444d5367"
 ironxrt_jll = "a846d562-341d-4e7d-a31c-6839ace40484"
 mlir_aie_jll = "2db12af9-d9f4-5b21-b666-63f8a71d6323"
 xrt_jll = "bb401bc5-fb22-5674-bf0e-333823e8805f"
@@ -18,9 +18,9 @@ DLFP8Types = "f4c16678-4a16-415b-82ef-ed337c5d6c7c"
 Microfloats = "31c70f10-a750-4521-b13c-797315ae2933"
 
 [sources]
+AIE_LLVM_Backend_jll = {path = "/home/simeon/.julia/dev/AIE_LLVM_Backend_jll"}
 IRStructurizer = {rev = "fix-returnnode-operands", url = "https://github.com/simeonschaub/IRStructurizer.jl"}
 MLIR = {rev = "fix-mark-donate-and-text-printing", url = "https://github.com/simeonschaub/MLIR.jl"}
-Peano_jll = {path = "/home/simeon/.julia/dev/Peano_jll"}
 ironxrt_jll = {path = "/home/simeon/.julia/dev/ironxrt_jll"}
 mlir_aie_jll = {path = "/home/simeon/.julia/dev/mlir_aie_jll"}
 xrt_jll = {path = "/home/simeon/.julia/dev/xrt_jll"}
@@ -36,7 +36,6 @@ GPUArraysCore = "0.2"
 IRStructurizer = "0.6"
 MLIR = "0.2"
 Microfloats = "0.2"
-Peano_jll = "21"
 ironxrt_jll = "0.1"
 julia = "1.11"
 mlir_aie_jll = "1.3"
