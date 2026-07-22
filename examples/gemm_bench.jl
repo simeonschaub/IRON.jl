@@ -96,6 +96,31 @@ function gemm_mmt_acc!(
     return nothing
 end
 
+# The int8 big-tile kernel: AIE2P int8 matmul is 8x8 * 8x8 -> 8x8 (i32 acc, 512 MACs/op, 4x
+# the bf16 tile), so blocks are 8x8 and the accumulator is Int32. Same 128x16 big tile and
+# PHI-free k-loop as the bf16 kernel; N/16 cores.
+function gemm_i8_zero!(c::Tile{Int32, Tuple{64, 32}})
+    z = zero(Vec{64, Int32})
+    for j in 1:32
+        vstore!(z, c, 1, j)
+    end
+    return nothing
+end
+function gemm_i8_acc!(
+        a::Tile{Int8, Tuple{64, 128}}, b::Tile{Int8, Tuple{64, 16}},
+        c::Tile{Int32, Tuple{64, 32}},
+    )
+    for mb in 0:15, nb in 0:1
+        bi = mb * 2 + nb
+        for kb in 0:7
+            acc = vload(Mat{8, 8, Int32}, c, 1, bi + 1)
+            acc = vmatmul(vload(Mat{8, 8, Int8}, a, 1, mb * 8 + kb + 1), vload(Mat{8, 8, Int8}, b, 1, kb * 2 + nb + 1), acc)
+            vstore!(acc, c, 1, bi + 1)
+        end
+    end
+    return nothing
+end
+
 const AIECC_FLAGS = ["--alloc-scheme=basic-sequential"]
 const Tin, Tacc = BFloat16, Float32
 
@@ -165,6 +190,23 @@ function gemm_launch_mmt!(da, db, dc, M, K, N, m, k, n)
                 L2(In(da); blocks = (4, 8))[mi, kk],
                 L2(In(db); blocks = (8, 4))[kk, nj],
                 L2(Out(dc); blocks = (4, 4))[mi, nj],
+            )
+        end
+    end
+    return nothing
+end
+
+# The int8 big-tile GEMM on L2, same 128x16 tile / N/16 cores as gemm_launch_mmt! but 8x8x8
+# int8 matmuls (i32 acc). m,k,n args ignored (fixed 128/64/16); kept for the shared signature.
+function gemm_launch_i8!(da, db, dc, M, K, N, m, k, n)
+    @iron stack_size = 3328 flags = AIECC_FLAGS for mi in 1:div(M, 128), nj in 1:div(N, 16)
+        @cores nj
+        @init gemm_i8_zero!(dc)
+        @reduce for kk in 1:div(K, 64)
+            gemm_i8_acc!(
+                L2(In(da); blocks = (8, 8))[mi, kk],
+                L2(In(db); blocks = (8, 8))[kk, nj],
+                L2(Out(dc); blocks = (8, 8))[mi, nj],
             )
         end
     end
@@ -263,15 +305,16 @@ if get(ENV, "IRON_RUN", "0") == "1"
     #    end
     #end
 
-    # Does the winning 16x32x16 `vmatmul` tile beat scalar-broadcast across the full L2 core
-    # array? Same L2 topology (A broadcasts, B distributes, C joins) and same core count
-    # (N/16) for both kernels, on *tall* GEMMs (large M·K, small N). N = 64/128/256/512 ->
-    # 4/8/16/32 cores (1/2/4/8 memtile groups). The vmatmul column drives the sub-tiled kernel
-    # through the same array -- its ratio over scalar-L2 is the whole-stack payoff at scale.
+    # bf16 vs int8 `vmatmul` across the full L2 core array. All three kernels share the L2
+    # topology (A broadcasts, B distributes, C joins) and core count (N/16) on *tall* GEMMs
+    # (large M·K, small N). N = 64/128/256/512 -> 4/8/16/32 cores. Columns: scalar-broadcast
+    # bf16, big-tile bf16 `vmatmul`, big-tile int8 `vmatmul` (8x8x8, 4x MACs/op + half the
+    # input bytes). GF/s = GOP/s = 2*M*N*K/t regardless of dtype; the i8/bf16 ratio is the
+    # datatype win at scale.
     println()
-    @printf("%-14s  %5s  %6s  %13s  %13s  %10s\n",
-            "M=K x N", "ok", "cores", "L2 scalar GF/s", "L2 vmatmul GF/s", "vmm/scalar")
-    println("-"^70)
+    @printf("%-14s  %5s  %6s  %11s  %11s  %11s  %8s\n",
+            "M=K x N", "ok", "cores", "scalar bf16", "vmm bf16", "vmm int8", "i8/bf16")
+    println("-"^74)
     # Default keeps the run short; IRON_BENCH_FULL=1 adds the 16- and 32-core designs, whose
     # large MLIR is slow to compile.
     tall = [(512, 64), (512, 128)]
@@ -286,9 +329,15 @@ if get(ENV, "IRON_RUN", "0") == "1"
             dc = NPUArray{Tacc}(undef, Tile{Tacc, Tuple{M, N}})
             l2 = time_launch(gemm_launch_l2!, da, db, dc, a, b, M, K, N, m, k, n; trials = 10)
             mt = time_launch(gemm_launch_mmt!, da, db, dc, a, b, M, K, N, m, k, n; trials = 10)
-            @printf("%-14s  %5s  %6d  %13.2f  %13.2f  %9.2fx\n",
-                    "$(M)x$(K)x$(N)", (l2.ok && mt.ok) ? "yes" : "NO", ncores,
-                    l2.gflops, mt.gflops, mt.gflops / l2.gflops)
+            # int8 needs its own Int8/Int32 buffers.
+            ai = Int8[(i + j) % 7 for i in 1:M, j in 1:K]
+            bi = Int8[(i - 2j) % 5 for i in 1:K, j in 1:N]
+            dai, dbi = NPUArray(ai), NPUArray(bi)
+            dci = NPUArray{Int32}(undef, Tile{Int32, Tuple{M, N}})
+            i8 = time_launch(gemm_launch_i8!, dai, dbi, dci, ai, bi, M, K, N, m, k, n; trials = 10)
+            @printf("%-14s  %5s  %6d  %11.2f  %11.2f  %11.2f  %7.2fx\n",
+                    "$(M)x$(K)x$(N)", (l2.ok && mt.ok && i8.ok) ? "yes" : "NO", ncores,
+                    l2.gflops, mt.gflops, i8.gflops, i8.gflops / mt.gflops)
         catch e
             @printf("%-14s  %5s  %s\n", "$(M)x$(K)x$(N)", "ERR", sprint(showerror, e))
         end
