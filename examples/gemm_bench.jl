@@ -275,43 +275,12 @@ end
 
 if get(ENV, "IRON_RUN", "0") == "1"
     sizes = [128, 512]      # 128 -> 8 cores (the multi-core point); 512 -> single-core ceiling
-
-    #@printf("%-12s  %5s  %11s  %6s  %11s  %8s  %10s\n",
-    #        "M=K=N", "ok", "1-core GF/s", "cores", "N-core GF/s", "speedup", "host BLAS")
-    #println("-"^76)
-    #for s in sizes
-    #    try
-    #        r = bench_size(s, s, s)
-    #        hg = bench_host(s, s, s)
-    #        if r.multi.ok
-    #            @printf("%-12s  %5s  %11.2f  %6d  %11.2f  %7.2fx  %10.1f\n",
-    #                    "$(s)³", r.single.ok ? "yes" : "NO",
-    #                    r.single.gflops, r.ncores, r.multi.gflops,
-    #                    r.multi.gflops / r.single.gflops, hg)
-    #        else
-    #            # Multi-core did not run (over the core budget, or a compile/mismatch);
-    #            # still report the single-core number and why the parallel one is absent.
-    #            @printf("%-12s  %5s  %11.2f  %6d  %11s  %8s  %10.1f\n",
-    #                    "$(s)³", r.single.ok ? "yes" : "NO",
-    #                    r.single.gflops, r.ncores, "-", "-", hg)
-    #            @printf("       ^ %d-core: %s\n", r.ncores, get(r.multi, :err, "mismatch"))
-    #        end
-    #    catch e
-    #        # A size can fail to *compile* rather than mis-compute -- e.g. a long reduction
-    #        # that overruns the shim's buffer-descriptor budget. Report it and keep going.
-    #        msg = sprint(showerror, e)
-    #        note = occursin("buffer descriptors", msg) ? "shim BD limit" : "compile/run failed"
-    #        @printf("%-12s  %5s  %s\n", "$(s)³", "ERR", note)
-    #    end
-    #end
-
     # bf16 vs int8 `vmatmul` across the full L2 core array. All three kernels share the L2
     # topology (A broadcasts, B distributes, C joins) and core count (N/16) on *tall* GEMMs
     # (large M·K, small N). N = 64/128/256/512 -> 4/8/16/32 cores. Columns: scalar-broadcast
     # bf16, big-tile bf16 `vmatmul`, big-tile int8 `vmatmul` (8x8x8, 4x MACs/op + half the
     # input bytes). GF/s = GOP/s = 2*M*N*K/t regardless of dtype; the i8/bf16 ratio is the
     # datatype win at scale.
-    println()
     @printf("%-14s  %5s  %6s  %11s  %11s  %11s  %8s\n",
             "M=K x N", "ok", "cores", "scalar bf16", "vmm bf16", "vmm int8", "i8/bf16")
     println("-"^74)
@@ -351,7 +320,7 @@ if get(ENV, "IRON_RUN", "0") == "1"
         println()
         @printf("%-16s  %5s  %6s  %13s  %13s\n", "M=K x N", "ok", "cores", "bf16 GOP/s", "int8 GOP/s")
         println("-"^64)
-        for s in (512, 1024, 2048, 4096)
+        for s in (512, 1024, 2048, 4096, 8192, 16384)
             M = K = s; N = 512; m, k, n = 16, 32, 16       # 32 cores
             try
                 a = BFloat16[(i + j) % 7 for i in 1:M, j in 1:K]
