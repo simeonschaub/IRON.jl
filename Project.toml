@@ -4,7 +4,7 @@ version = "1.0.0-DEV"
 authors = ["Simeon David Schaub <simeon@schaub.rocks> and contributors"]
 
 [deps]
-AIE_LLVM_Backend_jll = "37145a88-5c43-5b67-ab3c-d118b6116073"
+AIE_LLVM_Toolchain_jll = "e1663226-ec2a-58f4-a67b-3f55d12a6125"
 Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
 GPUArraysCore = "46192b85-c4d5-4398-a991-12ede77f4527"
 IRStructurizer = "93e32bba-5bb8-402b-805d-ffb066edee93"
@@ -18,23 +18,19 @@ DLFP8Types = "f4c16678-4a16-415b-82ef-ed337c5d6c7c"
 Microfloats = "31c70f10-a750-4521-b13c-797315ae2933"
 
 [sources]
-AIE_LLVM_Backend_jll = {path = "/home/simeon/.julia/dev/AIE_LLVM_Backend_jll"}
-IRStructurizer = {rev = "fix-returnnode-operands", url = "https://github.com/simeonschaub/IRStructurizer.jl"}
-MLIR = {rev = "fix-mark-donate-and-text-printing", url = "https://github.com/simeonschaub/MLIR.jl"}
 ironxrt_jll = {path = "/home/simeon/.julia/dev/ironxrt_jll"}
-mlir_aie_jll = {path = "/home/simeon/.julia/dev/mlir_aie_jll"}
-xrt_jll = {path = "/home/simeon/.julia/dev/xrt_jll"}
 
 [extensions]
 IRONDLFP8TypesExt = "DLFP8Types"
 IRONMicrofloatsExt = "Microfloats"
 
 [compat]
+AIE_LLVM_Toolchain_jll = "21.0.0"
 Adapt = "4"
 DLFP8Types = "0.1"
 GPUArraysCore = "0.2"
 IRStructurizer = "0.6"
-MLIR = "0.2"
+MLIR = "0.3"
 Microfloats = "0.2"
 ironxrt_jll = "0.1"
 julia = "1.11"
