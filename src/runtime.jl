@@ -165,7 +165,7 @@ function compile(
     mlir::AbstractString, nargs::Integer;
     path::Union{Nothing, AbstractString} = nothing,
     workdir::AbstractString = mktempdir(),
-    peano::AbstractString = AIE_LLVM_Backend_jll.artifact_dir,
+    peano::AbstractString = AIE_LLVM_Toolchain_jll.artifact_dir,
     flags::AbstractVector{<:AbstractString} = String[],
     verbose::Bool = false,
 )
