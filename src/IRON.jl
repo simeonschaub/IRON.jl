@@ -40,7 +40,7 @@ using IRStructurizer
 using Adapt: Adapt, adapt
 using GPUArraysCore: GPUArraysCore, AbstractGPUArray, @allowscalar
 
-import AIE_LLVM_Backend_jll
+import AIE_LLVM_Toolchain_jll
 using mlir_aie_jll: aiecc
 using ironxrt_jll: libironxrt
 using xrt_jll: xrt_jll
