@@ -9,7 +9,7 @@ Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
 GPUArraysCore = "46192b85-c4d5-4398-a991-12ede77f4527"
 IRStructurizer = "93e32bba-5bb8-402b-805d-ffb066edee93"
 MLIR = "bfde9dd4-8f40-4a1e-be09-1475335e1c92"
-ironxrt_jll = "a846d562-341d-4e7d-a31c-6839ace40484"
+XRT = "4d396880-2e3f-4be1-8c36-e87777010d00"
 mlir_aie_jll = "2db12af9-d9f4-5b21-b666-63f8a71d6323"
 xrt_jll = "bb401bc5-fb22-5674-bf0e-333823e8805f"
 
@@ -18,7 +18,7 @@ DLFP8Types = "f4c16678-4a16-415b-82ef-ed337c5d6c7c"
 Microfloats = "31c70f10-a750-4521-b13c-797315ae2933"
 
 [sources]
-ironxrt_jll = {path = "/home/simeon/.julia/dev/ironxrt_jll"}
+XRT = {path = "/home/simeon/Documents/rocm/mlir-aie/XRT"}
 
 [extensions]
 IRONDLFP8TypesExt = "DLFP8Types"
@@ -32,6 +32,6 @@ GPUArraysCore = "0.2"
 IRStructurizer = "0.6"
 MLIR = "0.3"
 Microfloats = "0.2"
-ironxrt_jll = "0.1"
+XRT = "0.2, 0.3"
 julia = "1.11"
 mlir_aie_jll = "1.3"

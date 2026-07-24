@@ -29,14 +29,14 @@ the device and back to keep the host mapping coherent -- so wrap any deliberate
 scalar access in `@allowscalar` (re-exported from GPUArraysCore).
 """
 mutable struct NPUArray{T, N} <: AbstractGPUArray{T, N}
-    bo::Ptr{Cvoid}      # XRT buffer object handle (owned; freed by finalizer)
+    bo::Union{XRT.XRTWrap.BO, Nothing}  # XRT buffer object (owned; freed with the array by the GC)
     data::Array{T, N}   # host mapping of the buffer's memory (own = false)
 end
 
 function NPUArray(A::AbstractArray{T, N}) where {T, N}
     a = _npu_empty(T, size(A))
     copyto!(a.data, A)
-    _xrt_bo_sync_to_device(a.bo)
+    _bo_sync_to_device(a.bo)
     return a
 end
 
@@ -45,7 +45,7 @@ NPUArray{T}(u::UndefInitializer, dims::Integer...) where {T} = NPUArray{T}(u, ma
 function NPUArray{T}(::UndefInitializer, dims::Dims{N}) where {T, N}
     a = _npu_empty(T, dims)
     fill!(a.data, zero(T))
-    _xrt_bo_sync_to_device(a.bo)
+    _bo_sync_to_device(a.bo)
     return a
 end
 
@@ -54,9 +54,9 @@ NPUArray{T}(u::UndefInitializer, ::Type{Tile{T, Dims}}) where {T, Dims} =
     NPUArray{T}(u, size(Tile{T, Dims}))
 
 """
-    buffer(a::NPUArray) -> Ptr{Cvoid}
+    buffer(a::NPUArray) -> XRT.XRTWrap.BO
 
-The underlying XRT buffer-object handle, as passed to the shim's launch. See
+The underlying XRT buffer object, as passed to the launch. See
 [`run!`](@ref).
 """
 buffer(a::NPUArray) = a.bo
@@ -72,7 +72,7 @@ Base.IndexStyle(::Type{<:NPUArray}) = IndexLinear()
 function Base.getindex(a::NPUArray, i::Int)
     @boundscheck checkbounds(a, i)
     GPUArraysCore.assertscalar("getindex")
-    _xrt_bo_sync_from_device(a.bo)
+    _bo_sync_from_device(a.bo)
     return @inbounds a.data[i]
 end
 
@@ -80,7 +80,7 @@ function Base.setindex!(a::NPUArray{T}, v, i::Int) where {T}
     @boundscheck checkbounds(a, i)
     GPUArraysCore.assertscalar("setindex!")
     @inbounds a.data[i] = convert(T, v)
-    _xrt_bo_sync_to_device(a.bo)
+    _bo_sync_to_device(a.bo)
     return a
 end
 
@@ -97,7 +97,7 @@ Base.similar(::Type{<:NPUArray{T}}, dims::Dims) where {T} = NPUArray{T}(undef, d
 Copy an NPU-resident buffer back to a host `Array`.
 """
 function Base.Array(a::NPUArray)
-    _xrt_bo_sync_from_device(a.bo)
+    _bo_sync_from_device(a.bo)
     return copy(a.data)
 end
 Base.collect(a::NPUArray) = Array(a)

@@ -42,7 +42,7 @@ using GPUArraysCore: GPUArraysCore, AbstractGPUArray, @allowscalar
 
 import AIE_LLVM_Toolchain_jll
 using mlir_aie_jll: aiecc
-using ironxrt_jll: libironxrt
+import XRT
 using xrt_jll: xrt_jll
 
 const CC = Core.Compiler
