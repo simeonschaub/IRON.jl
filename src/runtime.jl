@@ -43,6 +43,11 @@ end
 # The bank XRT assigns to a kernel argument.
 _group_id(kernel, argno::Integer) = XRT.XRTWrap.group_id(kernel, Cint(argno))
 
+# Milliseconds to wait for a launch before treating it as hung. `XRT.wait(run)` alone maps
+# to xrt::run::wait(0), which blocks forever, so an on-device deadlock never returns; a
+# bound turns that into an error. Override for a genuinely slow design.
+const RUN_TIMEOUT_MS = parse(UInt32, get(ENV, "IRON_RUN_TIMEOUT_MS", "120000"))
+
 # Launch: the fixed NPU argument layout is opcode (3), instruction BO, instruction
 # word count, then the data BOs in order. Scalars go as 64-bit; XRT copies only as
 # many bytes as the kernel's argument declares.
@@ -55,7 +60,10 @@ function _run(kernel, instr::Bo, ninstr::Integer, args::Vector{Bo})
         XRT.set_arg!(run, 2 + i, bo)
     end
     XRT.start(run)
-    XRT.wait(run)
+    state = XRT.wait(run, RUN_TIMEOUT_MS)
+    state == XRT.XRTWrap.ErtCmdState.COMPLETED || error(
+        "IRON: NPU launch did not complete (state=$state) within $(RUN_TIMEOUT_MS) ms; the \
+         design likely deadlocked on the NPU. Raise IRON_RUN_TIMEOUT_MS if it is merely slow.")
     return nothing
 end
 
