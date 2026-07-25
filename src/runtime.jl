@@ -31,7 +31,10 @@ _bo_sync_from_device(::Nothing) = nothing
 
 # Open the design: register the xclbin, open a hardware context on it and make the
 # kernel by name. The three objects are returned together because each must stay
-# alive for the kernel to be usable.
+# alive for the kernel to be usable. Opening the context reserves the design's NPU compute
+# columns and fails (DRM ... CREATE_HWCTX, errno -22) when they are exhausted -- held by
+# other live contexts (parallel processes or this process's other cached designs), or the
+# design needing more of the array than is free; `release!`/`empty_launch_cache!` free them.
 function _open_design(dev, xclbin_path::AbstractString, kernel_name::AbstractString)
     xclbin = XRT.XRTWrap.Xclbin(String(xclbin_path))
     uuid = XRT.XRTWrap.register_xclbin(dev, xclbin)
@@ -157,6 +160,24 @@ function _kernel!(c::CompiledProgram)
         c.xclbin_obj, c.hwctx, c.kernel = _open_design(_device!(), c.xclbin, KERNEL_NAME)
     end
     return c.kernel
+end
+
+"""
+    release!(c::CompiledProgram) -> c
+
+Free `c`'s NPU device resources -- its hardware context, kernel, launch and instruction
+buffer -- returning the compute columns to the device. The compiled xclbin stays cached, so
+a later [`run!`](@ref) transparently re-opens them. Use it to free hardware contexts when
+running many distinct designs (each holds one) on a device shared with other NPU programs.
+"""
+function release!(c::CompiledProgram)
+    # Destroy the CxxWrap objects now, most-dependent first (the run holds the kernel, the
+    # kernel the context), so the columns free promptly rather than at the next GC.
+    for obj in (c.run, c.kernel, c.hwctx, c.xclbin_obj, c.instr_bo)
+        obj === nothing || finalize(obj)
+    end
+    c.run = c.kernel = c.hwctx = c.xclbin_obj = c.instr_bo = nothing
+    return c
 end
 
 # Upload the instruction stream once, into a cacheable buffer in the bank XRT

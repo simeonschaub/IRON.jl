@@ -229,7 +229,11 @@ function time_launch(launch, da, db, dc, a, b, M, K, N, m, k, n; trials)
     for _ in 1:trials
         push!(times, @elapsed launch(da, db, dc, M, K, N, m, k, n))
     end
-    return (; ok = maxerr == 0, maxerr, gflops = 2.0 * M * N * K / minimum(times) / 1e9)
+    result = (; ok = maxerr == 0, maxerr, gflops = 2.0 * M * N * K / minimum(times) / 1e9)
+    # Free this design's hardware context before measuring the next, so the many distinct
+    # designs in the sweep don't accumulate contexts and exhaust the NPU's compute columns.
+    IRON.empty_launch_cache!()
+    return result
 end
 
 function bench_size(M, K, N; m = 16, k = 32, n = 16, trials = 20)
