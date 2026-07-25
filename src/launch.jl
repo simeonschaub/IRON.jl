@@ -188,6 +188,29 @@ end
 # The tiled-map design. The core side is exactly the whole-buffer core -- an unbounded
 # acquire/kernel/release loop over one tile per endpoint (`emit_core_body!`) -- since
 # a core already streams tile by tile; only the host DMA tiles the buffers.
+# The single-core device scaffolding shared by the tiled-map and single-core reduction
+# builders: one CoreTile, one ShimNOCTile per FIFO, and one shim<->core object FIFO per
+# operand (`names[i]`/`fifo_types[i]`/`dirs[i]`, `:in` feeding the core, `:out` draining
+# it). All the tiles are created before any FIFO so the emitted op order matches the
+# hand-written builders. Returns the core tile; the caller adds the core body and the host
+# runtime sequence. The multi-core reduction path lays out its own tiles (memtiles, groups).
+function _single_core_device!(ctx, device_body, names, fifo_types, dirs, depth)
+    core = logical_tile_op(ctx, CoreTile)
+    push!(device_body, core)
+    core_tile = IR.result(core, 1)
+    shims = IR.Value[]
+    for _ in eachindex(names)
+        t = logical_tile_op(ctx, ShimNOCTile)
+        push!(device_body, t)
+        push!(shims, IR.result(t, 1))
+    end
+    for i in eachindex(names)
+        prod, cons = dirs[i] === :in ? (shims[i], core_tile) : (core_tile, shims[i])
+        push!(device_body, objectfifo_op(ctx, names[i], prod, IR.Value[cons], objectfifo_type(ctx, fifo_types[i]), depth))
+    end
+    return core_tile
+end
+
 function _build_tiled_program(
         @nospecialize(kernel), dirs, buffer_types, tile_types, device, name;
         depth::Integer = 2, stack_size::Integer = 1024, ctx::IR.Context = context(),
@@ -200,22 +223,13 @@ function _build_tiled_program(
     coords = _grid_coords(first(grids))
 
     device_body = IR.Block(IR.Type[], IR.Location[])
-    core = logical_tile_op(ctx, CoreTile)
-    push!(device_body, core)
-    core_tile = IR.result(core, 1)
-    shims = IR.Value[]
-    for _ in 1:nargs
-        t = logical_tile_op(ctx, ShimNOCTile)
-        push!(device_body, t)
-        push!(shims, IR.result(t, 1))
-    end
+    core_tile = _single_core_device!(ctx, device_body, ["arg$i" for i in 1:nargs], tile_types, dirs, depth)
 
+    # The core streams one tile per endpoint (`emit_core_body!`), exactly the whole-buffer
+    # core; only the host DMA below tiles the buffers.
     endpoints = Endpoint[]
     for i in 1:nargs
-        T = tile_types[i]
-        prod, cons = dirs[i] === :in ? (shims[i], core_tile) : (core_tile, shims[i])
-        push!(device_body, objectfifo_op(ctx, "arg$i", prod, IR.Value[cons], objectfifo_type(ctx, T), depth))
-        fifo = ObjectFifo{T}("arg$i")
+        fifo = ObjectFifo{tile_types[i]}("arg$i")
         push!(endpoints, dirs[i] === :in ? consumer(fifo) : producer(fifo))
     end
 

@@ -447,20 +447,10 @@ function _build_schedule_program(
         # Single core: one shim tile per operand, exactly as the pre-`@cores` design (the
         # tile order and `op$i` FIFO names are preserved so the emitted module is
         # unchanged for existing single-core schedules).
-        core = logical_tile_op(ctx, CoreTile)
-        push!(device_body, core)
-        core_tile = IR.result(core, 1)
-        shims = IR.Value[]
-        for _ in specs
-            t = logical_tile_op(ctx, ShimNOCTile)
-            push!(device_body, t)
-            push!(shims, IR.result(t, 1))
-        end
-        for (i, s) in enumerate(specs)
-            into_core, from_core = shims[i], core_tile
-            producer_tile, consumer_tile = s.dir === :in ? (into_core, from_core) : (from_core, into_core)
-            push!(device_body, objectfifo_op(ctx, s.name, producer_tile, IR.Value[consumer_tile], objectfifo_type(ctx, s.tile_type), FIFO_DEPTH))
-        end
+        core_tile = _single_core_device!(
+            ctx, device_body,
+            [s.name for s in specs], [s.tile_type for s in specs], [s.dir for s in specs], FIFO_DEPTH,
+        )
         push!(device_body, core_op(ctx, core_tile, _emit_schedule_core!(ctx, init, step, specs, num_temporal, num_reduce); stack_size))
     else
         # Multi-core. Create every compute tile first so L2 FIFOs can name them as
