@@ -13,10 +13,16 @@
 An MLIR context with the upstream dialects registered and unregistered dialects
 allowed, so that `aie`/`aiex` operations can be built generically.
 """
+# Pass registration is process-global and idempotent, so do it only once.
+const _PASSES_REGISTERED = Ref(false)
+
 function context()
     registry = IR.DialectRegistry()
     API.mlirRegisterAllDialects(registry)
-    API.mlirRegisterAllPasses()
+    if !_PASSES_REGISTERED[]
+        API.mlirRegisterAllPasses()
+        _PASSES_REGISTERED[] = true
+    end
     ctx = IR.Context(registry)
     IR.allow_unregistered_dialects!(true; context = ctx)
     for dialect in ("func", "scf", "arith", "memref", "vector", "math")
