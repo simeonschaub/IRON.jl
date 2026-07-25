@@ -3,6 +3,13 @@
 # the way CUDA.jl, oneAPI.jl and Metal.jl do -- `Adapt` for converting a launch
 # argument to its kernel-side view, and GPUArraysCore's scalar-indexing guard.
 #
+# It deliberately depends on GPUArraysCore (the marker type + scalar guard) rather
+# than GPUArrays.jl: the NPU runs fixed compiled `@iron` designs, not arbitrary
+# KernelAbstractions kernels, so GPUArrays' generic broadcast/mapreduce have no
+# backend to lower onto. `NPUArray` is thus a device *buffer handle* -- allocation,
+# host<->device copies, and the launch-argument adaptor -- not a general compute
+# array; the show methods below stand in for the ones GPUArrays.jl would provide.
+#
 # This is the host counterpart to `Tile`, the *device*-side view a kernel sees.
 # A host `NPUArray{T,N}` adapts to the kernel `Tile{T,Tuple{dims...}}`, exactly as
 # a `CuArray` adapts to a `CuDeviceArray`. The buffer stays resident on the NPU
@@ -98,7 +105,26 @@ function Base.Array(a::NPUArray)
 end
 Base.collect(a::NPUArray) = Array(a)
 
+# Device <-> host and device <-> device copies. Each goes through the host mappings and
+# syncs the affected buffers, rather than Base's element-wise fallback -- which would copy
+# one element at a time through `getindex`/`setindex!` and trip the scalar-indexing guard.
 Base.copyto!(dst::AbstractArray, src::NPUArray) = copyto!(dst, Array(src))
+
+function Base.copyto!(dst::NPUArray, src::AbstractArray)
+    copyto!(dst.data, src)
+    _bo_sync_to_device(dst.bo)
+    return dst
+end
+
+function Base.copyto!(dst::NPUArray, src::NPUArray)
+    _bo_sync_from_device(src.bo)
+    copyto!(dst.data, src.data)
+    _bo_sync_to_device(dst.bo)
+    return dst
+end
+
+# A device-resident copy (the buffer is duplicated on the NPU, not brought to the host).
+Base.copy(a::NPUArray) = copyto!(_npu_empty(eltype(a), size(a)), a)
 
 # Show via one host copy (the GPUArrays convention), not per-element getindex, which
 # would trip the scalar-indexing guard. These are the entry points Base's show uses.
