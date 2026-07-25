@@ -219,12 +219,7 @@ function _build_tiled_program(
     push!(device_body, _emit_tiled_runtime!(ctx, dirs, buffer_types, tile_types, coords))
     push!(device_body, end_op(ctx))
 
-    mod = IR.Module(loc(ctx))
-    push!(IR.body(mod), device_op(ctx, device, name, region(device_body)))
-    IR.verify(IR.Operation(mod)) ||
-        error("IRON: @iron generated an invalid MLIR module (see the diagnostics above)")
-    canonicalize!(mod, ctx)
-    return string(IR.Operation(mod))
+    return finish_module(ctx, device, name, device_body; what = "@iron ")
 end
 
 # The runtime behind `@iron`. Splits the direction-tagged arguments, picks the

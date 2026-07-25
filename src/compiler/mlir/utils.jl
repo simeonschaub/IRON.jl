@@ -54,6 +54,19 @@ function canonicalize!(mod::IR.Module, ctx::IR.Context)
     return mod
 end
 
+# Wrap a built device body in a module, verify it, canonicalize, and return the text.
+# Verification only covers the upstream ops -- the aie ops are unregistered and carry no
+# verifier -- but that is enough to catch a malformed kernel before aiecc, where the same
+# mistake surfaces far less legibly. `what` names the design in the error message.
+function finish_module(ctx, device, name, device_body; what = "", canonicalize = true)
+    mod = IR.Module(loc(ctx))
+    push!(IR.body(mod), device_op(ctx, device, name, region(device_body)))
+    IR.verify(IR.Operation(mod)) ||
+        error("IRON: $(what)generated an invalid MLIR module (see the diagnostics above)")
+    canonicalize && canonicalize!(mod, ctx)
+    return string(IR.Operation(mod))
+end
+
 """
     opaque_attr(str; context) -> IR.Attribute
 
