@@ -113,6 +113,20 @@ _tile_pattern(bufdims::NTuple{N}, _, _) where {N} = error(
 # (see runtime.jl), so a hot loop of `@iron` calls compiles and opens the device once.
 const _LAUNCH_CACHE = Dict{Any, CompiledProgram}()
 
+"""
+    empty_launch_cache!()
+
+Release every cached `@iron` design ([`release!`](@ref)) and empty the launch cache,
+returning all NPU hardware contexts to the device. The next `@iron` launch of a design
+recompiles it. Use it to reclaim compute columns between phases of a program that runs many
+distinct designs, or on a device shared with other NPU programs.
+"""
+function empty_launch_cache!()
+    foreach(release!, values(_LAUNCH_CACHE))
+    empty!(_LAUNCH_CACHE)
+    return nothing
+end
+
 # Emit one host DMA on `body` as a configured-and-started task over the FIFO `fname`,
 # moving the tile described by `(offset, dims, len)` to/from the memref `arg`. Returns the
 # task's completion token (for a later `await`).
