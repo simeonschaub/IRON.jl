@@ -84,10 +84,6 @@ function _tile_grid(buffer::Type{<:Tile}, tile::Type{<:Tile})
     return bd .÷ td
 end
 
-# The tile positions, 0-based, in column-major order (first axis fastest) -- the same
-# order every buffer is walked in, so the k-th position names the k-th tile of each.
-_grid_coords(grid::Dims) = [Tuple(c) .- 1 for c in CartesianIndices(grid)]
-
 # The (offset, dims, len) buffer-descriptor access pattern that gathers the tile at
 # 0-based grid position `g` from a column-major buffer. `dims` is the four (size,
 # stride) pairs the hardware walks, innermost last; the two leading `(1, 0)` pad to
@@ -117,10 +113,6 @@ _tile_pattern(bufdims::NTuple{N}, _, _) where {N} = error(
 # (see runtime.jl), so a hot loop of `@iron` calls compiles and opens the device once.
 const _LAUNCH_CACHE = Dict{Any, CompiledProgram}()
 
-# The host DMA for a tiled map: for each tile position, in the shared grid order,
-# start the input transfers that feed the core and the output transfers that drain
-# it, then wait for the outputs before moving on -- bounding the in-flight descriptors
-# to one tile, the same discipline the `for`-form reduction uses per output tile.
 # Emit one host DMA on `body` as a configured-and-started task over the FIFO `fname`,
 # moving the tile described by `(offset, dims, len)` to/from the memref `arg`. Returns the
 # task's completion token (for a later `await`).
@@ -134,41 +126,6 @@ function _dma_task!(ctx, body, arg, fname, offset, dims, len; token)
     return IR.result(task, 1)
 end
 
-function _emit_tiled_runtime!(ctx::IR.Context, dirs, buffer_types, tile_types, coords)
-    arg_types = IR.Type[memref_type(ctx, T) for T in buffer_types]
-    body = IR.Block(arg_types, [loc(ctx) for _ in arg_types])
-    args = IR.Value[IR.argument(body, i) for i in eachindex(buffer_types)]
-
-    tile_task(i, coord; token) = _dma_task!(
-        ctx, body, args[i], "arg$i",
-        _tile_pattern(size(buffer_types[i]), size(tile_types[i]), coord)...; token,
-    )
-
-    for coord in coords
-        pending, outs = IR.Value[], IR.Value[]
-        for i in eachindex(dirs)
-            if dirs[i] === :in
-                push!(pending, tile_task(i, coord; token = false))
-            else
-                push!(outs, tile_task(i, coord; token = true))
-            end
-        end
-        # Await the outputs (a `dma_await_task` also frees the task, so only a token
-        # task may be awaited), then free the tokenless inputs. At least one output is
-        # guaranteed by the check in `_iron_launch`.
-        for o in outs
-            push!(body, dma_await_task_op(ctx, o))
-        end
-        for p in pending
-            push!(body, dma_free_task_op(ctx, p))
-        end
-    end
-    return runtime_sequence_op(ctx, "sequence", region(body))
-end
-
-# The tiled-map design. The core side is exactly the whole-buffer core -- an unbounded
-# acquire/kernel/release loop over one tile per endpoint (`emit_core_body!`) -- since
-# a core already streams tile by tile; only the host DMA tiles the buffers.
 # The single-core device scaffolding shared by the tiled-map and single-core reduction
 # builders: one CoreTile, one ShimNOCTile per FIFO, and one shim<->core object FIFO per
 # operand (`names[i]`/`fifo_types[i]`/`dirs[i]`, `:in` feeding the core, `:out` draining
@@ -192,39 +149,12 @@ function _single_core_device!(ctx, device_body, names, fifo_types, dirs, depth)
     return core_tile
 end
 
-function _build_tiled_program(
-        @nospecialize(kernel), dirs, buffer_types, tile_types, device, name;
-        depth::Integer = 2, stack_size::Integer = 1024, ctx::IR.Context = context(),
-    )
-    nargs = length(dirs)
-    grids = map(_tile_grid, buffer_types, tile_types)
-    allequal(grids) || error(
-        "IRON: @iron tiling needs every buffer to split into the same tile grid, got $grids"
-    )
-    coords = _grid_coords(first(grids))
-
-    device_body = IR.Block(IR.Type[], IR.Location[])
-    core_tile = _single_core_device!(ctx, device_body, ["arg$i" for i in 1:nargs], tile_types, dirs, depth)
-
-    # The core streams one tile per endpoint (`emit_core_body!`), exactly the whole-buffer
-    # core; only the host DMA below tiles the buffers.
-    endpoints = Endpoint[]
-    for i in 1:nargs
-        fifo = ObjectFifo{tile_types[i]}("arg$i")
-        push!(endpoints, dirs[i] === :in ? consumer(fifo) : producer(fifo))
-    end
-
-    worker = Worker(kernel, endpoints; stack_size)
-    push!(device_body, core_op(ctx, core_tile, emit_core_body!(ctx, worker); stack_size))
-    push!(device_body, _emit_tiled_runtime!(ctx, dirs, buffer_types, tile_types, coords))
-    push!(device_body, end_op(ctx))
-
-    return finish_module(ctx, device, name, device_body; what = "@iron ")
-end
-
-# The runtime behind `@iron`. Splits the direction-tagged arguments, builds the design
-# (a whole-buffer argument is just a 1x1 grid), compiles once per distinct shape, and
-# runs it on the buffers in place.
+# The runtime behind `@iron`'s call form. A map is a reduction with no reduce axis: every
+# buffer splits into the *same* grid, so name one space axis per grid dimension, index
+# every buffer by all of them (the k-th tile of each corresponds), and build the same
+# operand `specs` the `for` form does -- then defer to the reduction codegen in
+# `schedule.jl`. A whole-buffer argument is the 1x1-grid case. Compiles once per distinct
+# shape and runs it on the buffers in place.
 function _iron_launch(
     @nospecialize(kernel), args::Tuple;
     device::AIEDevice = npu2,
@@ -233,7 +163,7 @@ function _iron_launch(
     verbose::Bool = false,
     stack_size::Integer = 1024,
 )
-    dirs = map(_dir, args)
+    dirs = collect(map(_dir, args))
     arrays = map(_array, args)
     buffer_types = map(kernelconvert, arrays)   # the whole-buffer tile type per arg
     tile_types = map(_tile_of, args)            # what the kernel sees per step
@@ -248,13 +178,31 @@ function _iron_launch(
         )
     end
 
+    grids = map(_tile_grid, buffer_types, tile_types)
+    allequal(grids) || error(
+        "IRON: @iron tiling needs every buffer to split into the same tile grid, got $grids"
+    )
+    grid = first(grids)
+    # One space axis per grid dimension; every buffer is indexed by all of them.
+    axes = [Symbol(:g, d) for d in eachindex(grid)]
+    space = Tuple{Symbol, Int}[(axes[d], grid[d]) for d in eachindex(grid)]
+    specs = [
+        (
+            dir = dirs[i], array = arrays[i], access = axes, name = "op$i", l2pattern = nothing,
+            buffer_type = buffer_types[i], tile_type = tile_types[i], core_type = tile_types[i],
+            dims = Tuple{Int, Int}[], blocks = nothing,
+        )
+        for i in eachindex(args)
+    ]
+
     key = (typeof(kernel), buffer_types, tile_types, dirs, device, String(name), Tuple(flags), Int(stack_size))
     compiled = get!(_LAUNCH_CACHE, key) do
-        # One builder for both call-form shapes: a whole-buffer argument is the 1x1-grid
-        # case of a tiled map (its tile is the whole buffer), so `_build_tiled_program`
-        # handles it with a single grid coordinate and one transfer per buffer.
-        mlir = _build_tiled_program(kernel, dirs, buffer_types, tile_types, device, name; stack_size)
-        compile(mlir, collect(dirs); flags, verbose)
+        # A pure map: no reduction axes, no `@init`, no `@cores` (single core).
+        mlir = _build_schedule_program(
+            nothing, kernel, specs, Tuple{Symbol, Int}[], space, Tuple{Symbol, Int}[],
+            device, name, Int(stack_size),
+        )
+        compile(mlir, dirs; flags, verbose)
     end
 
     run!(compiled, arrays...)
