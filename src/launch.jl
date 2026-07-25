@@ -126,12 +126,12 @@ function _dma_task!(ctx, body, arg, fname, offset, dims, len; token)
     return IR.result(task, 1)
 end
 
-# The single-core device scaffolding shared by the tiled-map and single-core reduction
-# builders: one CoreTile, one ShimNOCTile per FIFO, and one shim<->core object FIFO per
-# operand (`names[i]`/`fifo_types[i]`/`dirs[i]`, `:in` feeding the core, `:out` draining
-# it). All the tiles are created before any FIFO so the emitted op order matches the
-# hand-written builders. Returns the core tile; the caller adds the core body and the host
-# runtime sequence. The multi-core reduction path lays out its own tiles (memtiles, groups).
+# The single-core device scaffolding for the reduction builder (`_build_schedule_program`,
+# which both `@iron` forms now use): one CoreTile, one ShimNOCTile per FIFO, and one
+# shim<->core object FIFO per operand (`names[i]`/`fifo_types[i]`/`dirs[i]`, `:in` feeding
+# the core, `:out` draining it). All the tiles are created before any FIFO so the emitted
+# op order is deterministic. Returns the core tile; the caller adds the core body and the
+# host runtime sequence. The multi-core path lays out its own tiles (memtiles, groups).
 function _single_core_device!(ctx, device_body, names, fifo_types, dirs, depth)
     core = logical_tile_op(ctx, CoreTile)
     push!(device_body, core)

@@ -1,7 +1,9 @@
-# The tiled-*reduction* schedule behind `@iron`'s `for` form (a GEMM is the archetype):
-# an output tile held across an inner loop that streams the input operands and
-# accumulates into it, each operand's tile addressed by a different mix of the loop
-# variables. See the `@iron` docstring for the surface syntax.
+# The codegen behind `@iron`, for both surface forms. The archetype is the `for`-form
+# tiled *reduction* (a GEMM): an output tile held across an inner loop that streams the
+# input operands and accumulates into it, each operand's tile addressed by a different mix
+# of the loop variables. The call form -- a map -- is the degenerate case with no reduction
+# axis, and `_iron_launch` (launch.jl) builds its operand `specs` and calls in here too.
+# See the `@iron` docstring for the surface syntax.
 #
 # A tile shape is never annotated -- it follows from the buffer shape and the extents of
 # the axes indexing it: buffer dimension of extent `D` indexed by an axis of extent `E`
