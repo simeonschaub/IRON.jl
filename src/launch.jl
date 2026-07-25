@@ -1,9 +1,11 @@
-# The `@iron` call form: a single-core design described by its kernel and buffers, on
-# top of the `Program`/`Worker`/`Runtime` layer in `dataflow.jl`. Two shapes: whole-buffer
-# (each NPUArray is one tile, kernel runs once -- the `add_one` case) and tiled *map*
-# (each NPUArray splits into the *same* grid, the kernel runs once per corresponding tile).
-# Reductions like GEMM -- output tile held across an inner operand-streaming loop -- can't
-# be read off the kernel and use `@iron`'s `for` form instead (see `schedule.jl`).
+# The `@iron` call form: a single-core design described by its kernel and buffers. It
+# reuses the `Worker`/`emit_core_body!` core emitter from `dataflow.jl` but assembles the
+# `aie.device` itself so it can tile the host DMA. One shape covers both cases -- whole
+# buffer (each NPUArray is one tile, kernel runs once) and tiled *map* (each NPUArray
+# splits into the *same* grid, kernel runs once per corresponding tile) -- since a whole
+# buffer is a 1x1 grid. Reductions like GEMM -- output tile held across an inner
+# operand-streaming loop -- can't be read off the kernel and use `@iron`'s `for` form
+# instead (see `schedule.jl`).
 #
 # An AIE buffer streams through a *unidirectional* object FIFO: fed host->core (input) or
 # drained core->host (output). The front end can't guess that direction, so each argument
@@ -115,27 +117,6 @@ _tile_pattern(bufdims::NTuple{N}, _, _) where {N} = error(
 # (see runtime.jl), so a hot loop of `@iron` calls compiles and opens the device once.
 const _LAUNCH_CACHE = Dict{Any, CompiledProgram}()
 
-# The whole-buffer design (one tile per buffer): defer to the dataflow layer directly.
-function _build_program(@nospecialize(kernel), dirs, arrays, device, name)
-    rt = Runtime()
-    worker_endpoints = Endpoint[]
-    fifos = ObjectFifo[]
-    for (i, arr) in enumerate(arrays)
-        fifo = ObjectFifo{kernelconvert(arr)}("arg$i")
-        push!(fifos, fifo)
-        push!(worker_endpoints, dirs[i] === :in ? consumer(fifo) : producer(fifo))
-    end
-    start!(rt, Worker(kernel, worker_endpoints))
-    for (i, _) in enumerate(arrays)
-        if dirs[i] === :in
-            fill!(rt, producer(fifos[i]), i)
-        else
-            drain!(rt, consumer(fifos[i]), i)
-        end
-    end
-    return Program(device, rt, Type[kernelconvert(a) for a in arrays]; name)
-end
-
 # The host DMA for a tiled map: for each tile position, in the shared grid order,
 # start the input transfers that feed the core and the output transfers that drain
 # it, then wait for the outputs before moving on -- bounding the in-flight descriptors
@@ -241,9 +222,9 @@ function _build_tiled_program(
     return finish_module(ctx, device, name, device_body; what = "@iron ")
 end
 
-# The runtime behind `@iron`. Splits the direction-tagged arguments, picks the
-# whole-buffer or tiled path, compiles once per distinct shape, and runs it on the
-# buffers in place.
+# The runtime behind `@iron`. Splits the direction-tagged arguments, builds the design
+# (a whole-buffer argument is just a 1x1 grid), compiles once per distinct shape, and
+# runs it on the buffers in place.
 function _iron_launch(
     @nospecialize(kernel), args::Tuple;
     device::AIEDevice = npu2,
@@ -269,12 +250,11 @@ function _iron_launch(
 
     key = (typeof(kernel), buffer_types, tile_types, dirs, device, String(name), Tuple(flags), Int(stack_size))
     compiled = get!(_LAUNCH_CACHE, key) do
-        if all(tile_types .=== buffer_types)
-            compile(_build_program(kernel, dirs, arrays, device, name); flags, verbose)
-        else
-            mlir = _build_tiled_program(kernel, dirs, buffer_types, tile_types, device, name; stack_size)
-            compile(mlir, dirs; flags, verbose)
-        end
+        # One builder for both call-form shapes: a whole-buffer argument is the 1x1-grid
+        # case of a tiled map (its tile is the whole buffer), so `_build_tiled_program`
+        # handles it with a single grid coordinate and one transfer per buffer.
+        mlir = _build_tiled_program(kernel, dirs, buffer_types, tile_types, device, name; stack_size)
+        compile(mlir, dirs; flags, verbose)
     end
 
     run!(compiled, arrays...)
