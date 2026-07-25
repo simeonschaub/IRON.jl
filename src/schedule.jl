@@ -321,6 +321,11 @@ function _emit_schedule_runtime!(ctx::IR.Context, specs, spatial, temporal, redu
         return t
     end
 
+    # Diagnostic: with IRON_DRAIN_EACH_TILE=1, fully drain each output tile before feeding
+    # the next (the pre-ping-pong barrier). Kills compute/DMA overlap; use only to test
+    # whether the carried-window ping-pong is what deadlocks a design.
+    drain_each = get(ENV, "IRON_DRAIN_EACH_TILE", "0") == "1"
+
     for tc in _axis_coords(temporal)
         # Advance the reduction in lockstep across the cores: feed *every* core its rc-th
         # input tiles before moving to rc+1, so they compute concurrently -- feeding one
@@ -352,6 +357,17 @@ function _emit_schedule_runtime!(ctx::IR.Context, specs, spatial, temporal, redu
             for i in direct_out
                 window!(outflight, (i, cidx), task(i, _fifo_name(i, cidx, num_cores), size(specs[i].tile_type), grid_of(specs[i], merge(sc, tc)); token = true))
             end
+        end
+
+        if drain_each   # barrier: await this tile's outputs, then its trailing inputs
+            for q in values(outflight), t in q
+                retire(t)
+            end
+            for q in values(inflight), t in q
+                retire(t)
+            end
+            foreach(empty!, values(outflight))
+            foreach(empty!, values(inflight))
         end
     end
 
