@@ -84,8 +84,7 @@ function Base.setindex!(a::NPUArray{T}, v, i::Int) where {T}
     return a
 end
 
-Base.similar(a::NPUArray{T}) where {T} = NPUArray{T}(undef, size(a))
-Base.similar(a::NPUArray, ::Type{S}) where {S} = NPUArray{S}(undef, size(a))
+# Base derives the 1- and 2-arg `similar` from these.
 Base.similar(a::NPUArray, ::Type{S}, dims::Dims) where {S} = NPUArray{S}(undef, dims)
 Base.similar(::Type{<:NPUArray{T}}, dims::Dims) where {T} = NPUArray{T}(undef, dims)
 
@@ -104,11 +103,8 @@ Base.collect(a::NPUArray) = Array(a)
 
 Base.copyto!(dst::AbstractArray, src::NPUArray) = copyto!(dst, Array(src))
 
-# Displaying follows the GPUArrays convention: copy to the host once and let Base
-# render that, rather than scalar-indexing the device buffer element by element.
-# Base's array show reaches the elements through these four entry points; routing
-# each through a host `Array` replaces the per-element `getindex` -- which would trip
-# the scalar-indexing guard -- with one bulk copy, while still printing the contents.
+# Show via one host copy (the GPUArrays convention), not per-element getindex, which
+# would trip the scalar-indexing guard. These are the entry points Base's show uses.
 Base.print_array(io::IO, a::NPUArray) = Base.print_array(io, Array(a))
 Base._show_nonempty(io::IO, a::NPUArray, prefix::String) = Base._show_nonempty(io, Array(a), prefix)
 Base._show_empty(io::IO, a::NPUArray) = Base._show_empty(io, Array(a))

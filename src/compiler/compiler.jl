@@ -317,13 +317,10 @@ function emit_vector!(kc::KernelContext, block::IR.Block, jblock, inst, fn, ops,
     end
 
     if fn === vmatmul
-        # The shaped hardware matmul, emitted as a `vector.contract` and left for
-        # `convert-vector-to-aievec` to lower to `aievec.matmul` (that pass also reconciles
-        # the surrounding casts, which emitting the aievec op by hand does not). Each `Mat`
-        # is stored transposed (see `matrix_type`), so computing `a * b` in Julia means
-        # `contract(bᵀ, aᵀ) = (a*b)ᵀ`, which lands in the equally-transposed output tile --
-        # hence the operands are swapped here. The contraction is the standard `(m, n, k)`
-        # gemm: lhs indexed `(m, k)`, rhs `(k, n)`, accumulator `(m, n)`, reducing over `k`.
+        # Emit as `vector.contract` and let `convert-vector-to-aievec` lower to
+        # `aievec.matmul` (it also reconciles the surrounding casts). `Mat` is stored
+        # transposed (see `matrix_type`), so `a * b` is `contract(bᵀ, aᵀ) = (a*b)ᵀ` into the
+        # equally-transposed output -- hence the swapped operands. Standard `(m,n,k)` gemm.
         a, b, c = (lookup!(kc, block, o) for o in ops)
         op = vector.contract(
             b, a, c;

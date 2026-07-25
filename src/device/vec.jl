@@ -1,22 +1,14 @@
 # Vector kernels.
 #
-# The scalar unit on an AIE2 core cannot multiply floats -- an f32 matmul written
-# with scalar arithmetic compiles, runs, and returns wrong data, while the same
-# kernel over integers is correct. Float throughput lives in the vector unit, and
-# reaching it needs no knowledge of `aievec` here: aiecc already runs
-# `convert-vector-to-aievec` over every AIE2/AIE2p core, and that pipeline "ingests
-# arbitrary MLIR Vector code". So a kernel that says `vector<16xbf16>` arrives at
-# the same `mac_elem` intrinsic the C++ kernels reach through `aie::mmul`.
+# The AIE2 scalar unit cannot multiply floats -- an f32 matmul in scalar arithmetic
+# compiles and runs but returns wrong data. Float throughput is in the vector unit,
+# which aiecc reaches by running `convert-vector-to-aievec` over arbitrary `vector`
+# dialect code, so a kernel that says `vector<16xbf16>` needs no `aievec` knowledge here.
 #
-# `Vec{N,T}` is how a kernel says that. It is IRON's own rather than `SIMD.Vec`,
-# which restricts its element type to a fixed list that `BFloat16` is not on --
-# and bf16 is not incidental here but the whole point, since the MAC multiplies
-# bf16 and accumulates into f32, and an f32 `vector.fma` lowers *only* when both
-# operands come from an `arith.extf` on bf16.
-#
-# Like `Tile`, this is a marker type: it is never constructed and never runs. Its
-# operators exist to be inferred, and the kernel compiler rewrites them into the
-# `vector` dialect.
+# `Vec{N,T}` is how a kernel says that -- IRON's own, not `SIMD.Vec`, whose element type
+# list excludes `BFloat16` (the point here: the MAC multiplies bf16 into f32). Like
+# `Tile`, it is a marker type, never constructed; its operators exist only to be inferred
+# and rewritten into the `vector` dialect.
 
 """
     Vec{N,T}
@@ -32,11 +24,9 @@ Any element type [`mlir_eltype`](@ref) knows is allowed, `BFloat16` and the FP8
 formats included.
 """
 struct Vec{N, T}
-    # Never read, and no `Vec` is ever built. The field is here so that `Vec` is not
-    # a singleton: a type with one inhabitant lets inference replace any value of it
-    # with that constant, and every intrinsic below would come back as a folded
-    # `Vec{N,T}()` rather than a value the kernel compiler can lower. `Tile` gets
-    # away with being empty only because nothing returns one.
+    # Never read; present only so `Vec` is not a singleton -- a one-inhabitant type would
+    # let inference fold every intrinsic below into a constant `Vec{N,T}()` the kernel
+    # compiler can't lower. (`Tile` gets away with being empty because nothing returns one.)
     data::NTuple{N, T}
 end
 

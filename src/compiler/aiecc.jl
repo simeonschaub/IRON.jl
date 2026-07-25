@@ -69,12 +69,9 @@ function aiecc_compile(
     # aiecc skips xclbin generation with only a warning and no error.
     xrt_bin = joinpath(xrt_jll.artifact_dir, "bin")
     cmd = addenv(`$(aiecc()) $mlir_file $args`, "PATH" => xrt_bin * ":" * get(ENV, "PATH", ""))
-    # aiecc and the `xclbinutil` (XRT) it shells out to are chatty on stdout/stderr --
-    # xclbinutil's "XRT Build Version"/"Leaving xclbinutil" banner, aiecc's
-    # "Compilation completed successfully", and a spurious grep libpcre2 warning (a
-    # subprocess grep picking up Julia's private libpcre2 via the JLL's LD_LIBRARY_PATH).
-    # Swallow all of it by default; capture it so a failure can still be diagnosed, and
-    # let `verbose` (which also passes `--verbose` to aiecc) stream it straight through.
+    # aiecc and its xclbinutil subprocess are chatty on stdout/stderr. Swallow it by
+    # default but capture it so a failure can still be diagnosed; `verbose` (which also
+    # passes `--verbose` to aiecc) streams it straight through.
     if verbose
         run(cmd)
     else
