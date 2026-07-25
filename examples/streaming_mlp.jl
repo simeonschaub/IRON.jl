@@ -7,18 +7,33 @@
 # is its own compute core and the intermediate activations stream **core -> core through
 # on-chip object FIFOs**, never touching DDR:
 #
-#     host --[X]--> core1: relu(X·W1+b1) --[A1]--> core2: relu(A1·W2+b2) --[A2]-->
-#           core3: softmax(A2·W3+b3) --[Y]--> host
+#     host --[Xa]--> core1: relu(Xa·Wa1) --[Ha1]--> core2: relu(Ha1·Wa2) --[Ha2]-->
+#           core3: softmax(Ha2·Wa3) --[Y]--> host
 #
 # The `@iron begin ... end` block is the pipeline form: each statement is one stage on one
-# core. `In(x)`/`Out(y)` are the host boundary (streamed from/to DDR); a bare stream produced
-# by one stage and consumed by the next (`dA1`, `dA2`) becomes an inter-core FIFO. The stages
-# lower to a multi-worker `Program` -- see src/compiler/mlir/dataflow.jl.
+# core. `In(x)`/`Out(y)` are the host boundary; a bare stream produced by one stage and
+# consumed by the next (`dHa1`, `dHa2`) becomes an inter-core FIFO. The stages lower to a
+# multi-worker `Program` -- see src/compiler/mlir/dataflow.jl.
 #
-# Everything is one 16x16 tile: 16 samples on the vector lanes, 16 features per layer, so a
-# layer is a single-tile matmul the core does in one kernel call (no cross-tile reduction).
-# Operands are bf16 with f32 accumulate, the mixed precision the vector MAC is built around;
-# activations are emitted in bf16 so they feed the next matmul directly (see
+# ## Bias by augmentation (why there is no bias input)
+#
+# An AIE2 compute tile has only two input DMA channels, so each core takes exactly two
+# streams -- an activation and a weight -- plus its on-chip activation link; a separate bias
+# would be a third input and overrun the tile's DMA budget. So the bias is folded into the
+# matmul with the standard augmentation trick (see examples/feedforward_relu.jl):
+#
+#     Xa = [X | 1]     (batch, in+1)      -- append a column of ones
+#     Wa = [W ; bᵀ]    (in+1, out)        -- append the bias as the last row
+#     Xa · Wa = X·W + 1·bᵀ = X·W + b
+#
+# In a *pipeline* the intermediate activations must stay augmented too, so each hidden core
+# writes the ones column onto its output (`relu_layer!`'s last `vstore!`); the next core then
+# reads an already-augmented `[H | 1]`.
+#
+# Everything is one 16-wide tile: 16 samples on the vector lanes and 16 augmented features
+# (15 real + the ones column), so a layer is a single-tile matmul the core does in one kernel
+# call. Operands are bf16 with f32 accumulate, the mixed precision the vector MAC is built
+# around; activations are bf16 so they feed the next matmul directly (see
 # examples/feedforward_relu.jl and examples/mlp_softmax.jl for the bf16/exp/max details).
 #
 # Compiling and running need the AIE toolchain JLLs and an NPU, but no Python:
@@ -29,54 +44,53 @@ using IRON
 using BFloat16s: BFloat16
 using Random
 
-const TILE = 16   # AIE2 vector width: 16 f32 lanes / 32 bf16, and every dimension here.
+const TILE = 16   # AIE2 vector width; also the augmented feature width (15 real + 1 ones).
 
 # --- stage kernels: ordinary Julia functions, inlined into a core by `@iron` ----------
 
 """
-    relu_layer!(x, w, b, h)
+    relu_layer!(xa, wa, ha)
 
-One hidden layer, fused into a single core: `h = relu(x·w + b)`, narrowed to bf16 so it
-streams straight into the next layer's matmul. The matmul is column-major -- a column of the
-accumulator starts from the bias, then accumulates `x[:,p] * w[p,j]` down the shared
-dimension -- and the relu is a bf16 `max` (the type `aievec.max` supports), exact because the
-output is bf16 anyway.
+One hidden layer, fused into a single core: `ha = [ relu(xa·wa) | 1 ]`. The matmul (`xa·wa`
+over the augmented feature dimension `Ka`) already includes the bias, being `[X|1]·[W;bᵀ]`;
+the relu narrows to bf16 (a bf16 `max`, exact for a bf16 output), and the final `vstore!`
+writes the ones column so the activation streams out already augmented for the next core.
 """
 function relu_layer!(
-        x::Tile{BFloat16, Tuple{M, K}}, w::Tile{BFloat16, Tuple{K, N}},
-        b::Tile{Float32, Tuple{M, N}}, h::Tile{BFloat16, Tuple{M, N}},
-    ) where {M, K, N}
+        xa::Tile{BFloat16, Tuple{M, Ka}}, wa::Tile{BFloat16, Tuple{Ka, N}},
+        ha::Tile{BFloat16, Tuple{M, Na}},
+    ) where {M, Ka, N, Na}
     zerob = zero(Vec{M, BFloat16})
     for j in 1:N
-        acc = vload(Vec{M, Float32}, b, 1, j)             # start from the bias
-        for p in 1:K
-            av = vload(Vec{M, BFloat16}, x, 1, p)
-            bv = Vec{M, BFloat16}(w[p, j])                # broadcast w[p, j]
+        acc = zero(Vec{M, Float32})
+        for p in 1:Ka
+            av = vload(Vec{M, BFloat16}, xa, 1, p)
+            bv = Vec{M, BFloat16}(wa[p, j])                # broadcast wa[p, j]
             acc = muladd(Vec{M, Float32}(av), Vec{M, Float32}(bv), acc)
         end
-        vstore!(max(Vec{M, BFloat16}(acc), zerob), h, 1, j)   # relu, narrow to bf16
+        vstore!(max(Vec{M, BFloat16}(acc), zerob), ha, 1, j)   # relu, narrow to bf16
     end
+    vstore!(one(Vec{M, BFloat16}), ha, 1, Na)   # augmentation ones column (Na = N + 1)
     return nothing
 end
 
 """
-    softmax_layer!(x, w, b, y)
+    softmax_layer!(xa, wa, y)
 
-The output layer: the logits `x·w + b` into `y` (f32), then softmax per sample (per lane)
-over the `N` class columns. See examples/mlp_softmax.jl for why the max and exp are taken in
-bf16 (no f32 `aievec.max`/hardware exp) while the sum is f32 and the normalise multiply goes
-through bf16. `y` doubles as scratch across the three softmax passes.
+The output layer: the logits `xa·wa` (= H·W + b) into `y` (f32), then softmax per sample
+(per lane) over the `N` class columns -- no ones column, this is the final output. See
+examples/mlp_softmax.jl for why the max and exp are bf16 (no f32 `aievec.max`/hardware exp)
+while the sum is f32 and the normalise multiply goes through bf16. `y` doubles as scratch.
 """
 function softmax_layer!(
-        x::Tile{BFloat16, Tuple{M, K}}, w::Tile{BFloat16, Tuple{K, N}},
-        b::Tile{Float32, Tuple{M, N}}, y::Tile{Float32, Tuple{M, N}},
-    ) where {M, K, N}
-    # logits -> y (f32)
+        xa::Tile{BFloat16, Tuple{M, Ka}}, wa::Tile{BFloat16, Tuple{Ka, N}},
+        y::Tile{Float32, Tuple{M, N}},
+    ) where {M, Ka, N}
     for j in 1:N
-        acc = vload(Vec{M, Float32}, b, 1, j)
-        for p in 1:K
-            av = vload(Vec{M, BFloat16}, x, 1, p)
-            acc = muladd(Vec{M, Float32}(av), Vec{M, Float32}(Vec{M, BFloat16}(w[p, j])), acc)
+        acc = zero(Vec{M, Float32})
+        for p in 1:Ka
+            av = vload(Vec{M, BFloat16}, xa, 1, p)
+            acc = muladd(Vec{M, Float32}(av), Vec{M, Float32}(Vec{M, BFloat16}(wa[p, j])), acc)
         end
         vstore!(acc, y, 1, j)
     end
@@ -103,7 +117,9 @@ end
 
 # --- problem data (plain Julia; small values, exact/friendly in bf16) -----------------
 
-const BATCH, IN, H1, H2, CLASSES = TILE, TILE, TILE, TILE, TILE   # one 16x16 tile each
+# 15 real features per layer, augmented to 16 (the + 1 ones column carries the bias); a
+# 16-sample batch and 16 output classes, so every tile is 16-wide.
+const BATCH, IN, H1, H2, CLASSES = TILE, TILE - 1, TILE - 1, TILE - 1, TILE
 
 Random.seed!(0)
 mat(m, n) = Float32.(rand(-1:1, m, n)) ./ 2      # small weights keep logits well-conditioned
@@ -111,13 +127,14 @@ W1f, W2f, W3f = mat(IN, H1), mat(H1, H2), mat(H2, CLASSES)
 b1, b2, b3 = (Float32.(rand(-1:1, n)) ./ 2 for n in (H1, H2, CLASSES))
 Xf = Float32.(rand(-2:2, BATCH, IN)) ./ 2
 
-# bf16 device operands, built with comprehensions (a `BFloat16.(...)` broadcast hits an LLVM
-# x86 codegen bug at width 16 -- see feedforward_relu.jl). Biases as full (batch, out) f32
-# matrices so they co-tile with the activations.
-tobf(A) = BFloat16[BFloat16(Base.inferencebarrier(A[i, j])) for i in axes(A, 1), j in axes(A, 2)]
-biasmat(b) = Float32[b[j] for _ in 1:BATCH, j in eachindex(b)]
+# bf16 augmented operands, built with comprehensions (a `BFloat16.(...)` broadcast hits an
+# LLVM x86 codegen bug at width 16 -- see feedforward_relu.jl). `augx` appends the ones
+# column, `augw` appends the bias as the last row.
+bf(x) = BFloat16(Base.inferencebarrier(x))
+augx(X) = BFloat16[j <= size(X, 2) ? bf(X[i, j]) : one(BFloat16) for i in axes(X, 1), j in 1:size(X, 2) + 1]
+augw(W, b) = BFloat16[i <= size(W, 1) ? bf(W[i, j]) : bf(b[j]) for i in 1:size(W, 1) + 1, j in axes(W, 2)]
 
-# CPU reference: exact f32 forward pass.
+# CPU reference: exact f32 forward pass (with the biases).
 relu(A) = max.(A, 0.0f0)
 function softmax_rows(L)
     reduce(vcat, [(e = exp.(L[i, :] .- maximum(L[i, :])); (e ./ sum(e))') for i in axes(L, 1)])
@@ -129,21 +146,21 @@ Yref  = softmax_rows(H2ref * W3f .+ b3')
 const FLAGS = ["--alloc-scheme=basic-sequential"]
 
 if get(ENV, "IRON_RUN", "0") == "1"
-    dX = NPUArray(tobf(Xf))
-    dW1, dW2, dW3 = NPUArray(tobf(W1f)), NPUArray(tobf(W2f)), NPUArray(tobf(W3f))
-    dB1, dB2, dB3 = NPUArray(biasmat(b1)), NPUArray(biasmat(b2)), NPUArray(biasmat(b3))
+    dXa = NPUArray(augx(Xf))                       # [X | 1]      (16, 16)
+    dWa1, dWa2 = NPUArray(augw(W1f, b1)), NPUArray(augw(W2f, b2))   # [W ; bᵀ]  (16, 15)
+    dWa3 = NPUArray(augw(W3f, b3))                 # [W3 ; b3ᵀ]   (16, 16)
     dY = NPUArray{Float32}(undef, Tile{Float32, Tuple{BATCH, CLASSES}})
 
-    # On-chip activation streams between the layer cores -- allocated only for their shape;
-    # the pipeline never DMAs them (they live on core-to-core FIFOs).
-    dA1 = NPUArray{BFloat16}(undef, Tile{BFloat16, Tuple{BATCH, H1}})
-    dA2 = NPUArray{BFloat16}(undef, Tile{BFloat16, Tuple{BATCH, H2}})
+    # On-chip augmented activation streams between the layer cores -- allocated only for their
+    # shape; the pipeline never DMAs them (they live on core-to-core FIFOs).
+    dHa1 = NPUArray{BFloat16}(undef, Tile{BFloat16, Tuple{BATCH, H1 + 1}})
+    dHa2 = NPUArray{BFloat16}(undef, Tile{BFloat16, Tuple{BATCH, H2 + 1}})
 
     # The streaming pipeline: three chained cores, activations flowing on-chip.
     @iron flags = FLAGS stack_size = 3328 begin
-        dA1 = relu_layer!(In(dX),  In(dW1), In(dB1))
-        dA2 = relu_layer!(dA1,     In(dW2), In(dB2))
-        Out(dY) = softmax_layer!(dA2, In(dW3), In(dB3))
+        dHa1 = relu_layer!(In(dXa), In(dWa1))
+        dHa2 = relu_layer!(dHa1, In(dWa2))
+        Out(dY) = softmax_layer!(dHa2, In(dWa3))
     end
 
     Y = Array(dY)
@@ -163,7 +180,7 @@ if get(ENV, "IRON_RUN", "0") == "1"
     end
 else
     println("streaming feed-forward MLP: Y = softmax(relu(relu(X·W1+b1)·W2+b2)·W3+b3)")
-    println("  ", BATCH, "x", IN, " input, hidden ", H1, "/", H2, ", ", CLASSES, " classes")
+    println("  ", BATCH, "x", IN, " input, hidden ", H1, "/", H2, ", ", CLASSES, " classes (bias by augmentation)")
     println("  three chained cores; activations stream core->core on-chip (no DDR between layers)")
     println("Run on an NPU with:  IRON_RUN=1 julia --project=examples examples/streaming_mlp.jl")
     println()
