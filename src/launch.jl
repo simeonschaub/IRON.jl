@@ -140,21 +140,28 @@ end
 # start the input transfers that feed the core and the output transfers that drain
 # it, then wait for the outputs before moving on -- bounding the in-flight descriptors
 # to one tile, the same discipline the `for`-form reduction uses per output tile.
+# Emit one host DMA on `body` as a configured-and-started task over the FIFO `fname`,
+# moving the tile described by `(offset, dims, len)` to/from the memref `arg`. Returns the
+# task's completion token (for a later `await`).
+function _dma_task!(ctx, body, arg, fname, offset, dims, len; token)
+    bd = IR.Block(IR.Type[], IR.Location[])
+    push!(bd, dma_bd_op(ctx, arg, dims, len; offset))
+    push!(bd, end_op(ctx))
+    task = dma_configure_task_for_op(ctx, fname, region(bd); issue_token = token)
+    push!(body, task)
+    push!(body, dma_start_task_op(ctx, IR.result(task, 1)))
+    return IR.result(task, 1)
+end
+
 function _emit_tiled_runtime!(ctx::IR.Context, dirs, buffer_types, tile_types, coords)
     arg_types = IR.Type[memref_type(ctx, T) for T in buffer_types]
     body = IR.Block(arg_types, [loc(ctx) for _ in arg_types])
     args = IR.Value[IR.argument(body, i) for i in eachindex(buffer_types)]
 
-    function tile_task(i, coord; token)
-        offset, dims, len = _tile_pattern(size(buffer_types[i]), size(tile_types[i]), coord)
-        bd = IR.Block(IR.Type[], IR.Location[])
-        push!(bd, dma_bd_op(ctx, args[i], dims, len; offset))
-        push!(bd, end_op(ctx))
-        task = dma_configure_task_for_op(ctx, "arg$i", region(bd); issue_token = token)
-        push!(body, task)
-        push!(body, dma_start_task_op(ctx, IR.result(task, 1)))
-        return IR.result(task, 1)
-    end
+    tile_task(i, coord; token) = _dma_task!(
+        ctx, body, args[i], "arg$i",
+        _tile_pattern(size(buffer_types[i]), size(tile_types[i]), coord)...; token,
+    )
 
     for coord in coords
         pending, outs = IR.Value[], IR.Value[]
