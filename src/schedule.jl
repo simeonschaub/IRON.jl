@@ -267,17 +267,10 @@ function _emit_schedule_runtime!(ctx::IR.Context, specs, spatial, temporal, redu
     body = IR.Block(arg_types, [loc(ctx) for _ in specs])
     args = IR.Value[IR.argument(body, i) for i in eachindex(specs)]
 
-    function task(i, fname, tiledims, grid; token)
-        s = specs[i]
-        offset, dims, len = _tile_pattern(size(s.buffer_type), tiledims, grid)
-        bd = IR.Block(IR.Type[], IR.Location[])
-        push!(bd, dma_bd_op(ctx, args[i], dims, len; offset))
-        push!(bd, end_op(ctx))
-        t = dma_configure_task_for_op(ctx, fname, region(bd); issue_token = token)
-        push!(body, t)
-        push!(body, dma_start_task_op(ctx, IR.result(t, 1)))
-        return IR.result(t, 1)
-    end
+    task(i, fname, tiledims, grid; token) = _dma_task!(
+        ctx, body, args[i], fname,
+        _tile_pattern(size(specs[i].buffer_type), tiledims, grid)...; token,
+    )
     retire(t) = (push!(body, dma_await_task_op(ctx, t)); push!(body, dma_free_task_op(ctx, t)))
 
     core_names = Set(nm for (nm, _) in spatial)
