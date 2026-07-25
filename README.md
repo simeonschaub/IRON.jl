@@ -49,8 +49,8 @@ the Python IRON vector-increment example, and produces the module in
 Generating MLIR needs nothing but Julia. Compiling and running additionally need
 the MLIR-AIE toolchain, an NPU and XRT -- but no Python. The toolchain is shipped
 as JLL artifacts and driven directly: `mlir_aie_jll` and `AIE_LLVM_Toolchain_jll` provide the
-`aiecc` compile driver and the AIE LLVM backend, and `ironxrt_jll` (a small C
-shim over XRT's C++ runtime, built from `Yggdrasil/I/ironxrt`) drives the device.
+`aiecc` compile driver and the AIE LLVM backend, and `XRT.jl` drives the device
+using `xrt_jll` and `xrt_cxxwrap_jll`.
 Nothing to set up beyond having those installed:
 
 ```julia

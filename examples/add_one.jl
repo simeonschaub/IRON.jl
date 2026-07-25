@@ -1,8 +1,8 @@
 # The vector-increment design: the host streams 1024 int32s in, a core adds one to
 # each, and the result streams back. Julia port of the IRON example in test.py.
 #
-# Compiling and running need the AIE toolchain JLLs (mlir_aie_jll, Peano_jll,
-# ironxrt_jll) and an NPU -- but no Python:
+# Compiling and running need the AIE toolchain JLLs (mlir_aie_jll, AIE_LLVM_Toolchain_jll,
+# XRT.jl) and an NPU -- but no Python:
 #   julia --project examples/add_one.jl
 
 using IRON
