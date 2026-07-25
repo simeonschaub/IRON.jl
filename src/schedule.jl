@@ -599,12 +599,7 @@ function _build_schedule_program(
     push!(device_body, _emit_schedule_runtime!(ctx, specs, spatial, temporal, reduction, num_cores))
     push!(device_body, end_op(ctx))
 
-    mod = IR.Module(loc(ctx))
-    push!(IR.body(mod), device_op(ctx, device, name, region(device_body)))
-    IR.verify(IR.Operation(mod)) ||
-        error("IRON: the @iron reduction generated an invalid MLIR module (see the diagnostics above)")
-    canonicalize!(mod, ctx)
-    return string(IR.Operation(mod))
+    return finish_module(ctx, device, name, device_body; what = "the @iron reduction ")
 end
 
 # --- `@iron for` front end ---------------------------------------------------

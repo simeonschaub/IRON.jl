@@ -314,16 +314,5 @@ function generate_mlir(p::Program; canonicalize::Bool = true, ctx::IR.Context = 
     push!(device_body, emit_runtime_sequence!(ctx, p))
     push!(device_body, end_op(ctx))
 
-    mod = IR.Module(loc(ctx))
-    push!(IR.body(mod), device_op(ctx, p.device, p.name, region(device_body)))
-
-    # Verification only covers the upstream ops -- the aie ops are unregistered here
-    # and carry no verifier -- but that is enough to catch a malformed kernel before
-    # it reaches aiecc, where the same mistake surfaces far less legibly.
-    IR.verify(IR.Operation(mod)) || error(
-        "IRON: generated an invalid MLIR module (see the diagnostics above)"
-    )
-    canonicalize && canonicalize!(mod, ctx)
-
-    return string(IR.Operation(mod))
+    return finish_module(ctx, p.device, p.name, device_body; canonicalize)
 end
