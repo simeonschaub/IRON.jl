@@ -191,165 +191,197 @@ const VECTOR_OPS = Dict{Any, Any}(
     vmin => (arith.minimumf, arith.minsi),
 )
 
-function emit_vector!(kc::KernelContext, block::IR.Block, jblock, inst, fn, ops, ssa)
+# Each vector intrinsic's emitter, keyed by the function it lowers. Elementwise arith is
+# one shared emitter parameterised by VECTOR_OPS. `emit_call!` routes here on membership.
+const VECTOR_EMITTERS = Dict{Any, Function}()
+
+_result(kc, inst) = mlir_type(kc.ctx, inst[:type])
+
+function _emit_vload!(kc, block, jblock, inst, fn, ops, ssa)
     ctx = kc.ctx
     result = () -> mlir_type(ctx, inst[:type])
-
-    if fn === vload
-        # The element type is the first argument, a type rather than a value.
-        tile = lookup!(kc, block, ops[2])
-        indices = subscripts!(kc, block, tile, @view ops[3:end])
-        T = inst[:type]
-        if T <: Mat
-            # The AIE lowering does not handle a rank-2 `vector.load` (it scalarises into
-            # an unresolved `i64 -> index` cast), so read the R*C elements as a 1-D vector
-            # -- the supported path -- and `shape_cast` to the matrix shape.
-            R, C = size(T)
-            flat = vector.load(
-                tile, indices;
-                result = vector_type(ctx, Vec{R * C, eltype(T)}), location = loc(ctx),
-            )
-            push!(block, flat)
-            op = vector.shape_cast(IR.result(flat, 1); result = result(), location = loc(ctx))
-        else
-            op = vector.load(tile, indices; result = result(), location = loc(ctx))
-        end
-        push!(block, op)
-        kc.values[ssa] = IR.result(op, 1)
-        return nothing
-    end
-
-    if fn === vstore!
-        value = lookup!(kc, block, ops[1])
-        tile = lookup!(kc, block, ops[2])
-        indices = subscripts!(kc, block, tile, @view ops[3:end])
-        vt = IRStructurizer.value_type(jblock, ops[1])
-        if vt <: Mat
-            # Symmetric to the `Mat` load: flatten back to 1-D before the `vector.store`.
-            R, C = size(vt)
-            flat = vector.shape_cast(
-                value; result = vector_type(ctx, Vec{R * C, eltype(vt)}), location = loc(ctx),
-            )
-            push!(block, flat)
-            value = IR.result(flat, 1)
-        end
-        push!(block, vector.store(value, tile, indices; location = loc(ctx)))
-        return nothing
-    end
-
-    if fn === vbroadcast
-        source = lookup!(kc, block, ops[2])
-        op = vector.broadcast(source; vector = result(), location = loc(ctx))
-        push!(block, op)
-        kc.values[ssa] = IR.result(op, 1)
-        return nothing
-    end
-
-    if fn === vconvert
-        # Element type first, value second, as with the scalar conversions.
-        source = lookup!(kc, block, ops[2])
-        from = eltype(IRStructurizer.value_type(jblock, ops[2]))
-        to = eltype(inst[:type])
-        from === to && return (kc.values[ssa] = source; nothing)
-        if to <: Signed && from <: Signed
-            builder = bitwidth(to) > bitwidth(from) ? arith.extsi : arith.truncsi
-        elseif to <: Unsigned && from <: Unsigned
-            builder = bitwidth(to) > bitwidth(from) ? arith.extui : arith.truncui
-        elseif to <: AbstractFloat && from <: AbstractFloat
-            builder = bitwidth(to) > bitwidth(from) ? arith.extf : arith.truncf
-        else
-            error("Unsupported vector conversion from $from to $to")
-        end
-        op = builder(source; out = result(), location = loc(ctx))
-        push!(block, op)
-        kc.values[ssa] = IR.result(op, 1)
-        return nothing
-    end
-
-    if fn === vreinterpret
-        # Element type first, value second, as with `vconvert`; a bitcast is a pure
-        # relabel of the same bits, so the result vector type carries all the change.
-        source = lookup!(kc, block, ops[2])
-        op = arith.bitcast(source; out = result(), location = loc(ctx))
-        push!(block, op)
-        kc.values[ssa] = IR.result(op, 1)
-        return nothing
-    end
-
-    if fn === vexp
-        # The hardware exp: `convert-vector-to-aievec` turns `math.exp` on a bf16
-        # vector into the AIE exp intrinsic (bf16 only -- see `vexp`).
-        source = lookup!(kc, block, ops[1])
-        op = math.exp(source; result = result(), location = loc(ctx))
-        push!(block, op)
-        kc.values[ssa] = IR.result(op, 1)
-        return nothing
-    end
-
-    if fn === vreduce_add
-        source = lookup!(kc, block, ops[1])
-        op = vector.reduction(
-            source; dest = result(), kind = IR.Attribute("add"; context = ctx),
-            location = loc(ctx),
+    # The element type is the first argument, a type rather than a value.
+    tile = lookup!(kc, block, ops[2])
+    indices = subscripts!(kc, block, tile, @view ops[3:end])
+    T = inst[:type]
+    if T <: Mat
+        # The AIE lowering does not handle a rank-2 `vector.load` (it scalarises into
+        # an unresolved `i64 -> index` cast), so read the R*C elements as a 1-D vector
+        # -- the supported path -- and `shape_cast` to the matrix shape.
+        R, C = size(T)
+        flat = vector.load(
+            tile, indices;
+            result = vector_type(ctx, Vec{R * C, eltype(T)}), location = loc(ctx),
         )
-        push!(block, op)
-        kc.values[ssa] = IR.result(op, 1)
-        return nothing
+        push!(block, flat)
+        op = vector.shape_cast(IR.result(flat, 1); result = result(), location = loc(ctx))
+    else
+        op = vector.load(tile, indices; result = result(), location = loc(ctx))
     end
-
-    if fn === vfma
-        a, b, c = (lookup!(kc, block, o) for o in ops)
-        if eltype(inst[:type]) <: AbstractFloat
-            op = vector.fma(a, b, c; result = result(), location = loc(ctx))
-            push!(block, op)
-        else
-            # vector.fma is floating-point only, so an integer multiply-accumulate
-            # is spelled out. The two ops fuse again downstream.
-            mul = arith.muli(a, b; result = result(), location = loc(ctx))
-            push!(block, mul)
-            op = arith.addi(
-                IR.result(mul, 1), c; result = result(), location = loc(ctx)
-            )
-            push!(block, op)
-        end
-        kc.values[ssa] = IR.result(op, 1)
-        return nothing
-    end
-
-    if fn === vmatmul
-        # Emit as `vector.contract` and let `convert-vector-to-aievec` lower to
-        # `aievec.matmul` (it also reconciles the surrounding casts). `Mat` is stored
-        # transposed (see `matrix_type`), so `a * b` is `contract(bᵀ, aᵀ) = (a*b)ᵀ` into the
-        # equally-transposed output -- hence the swapped operands. Standard `(m,n,k)` gemm.
-        a, b, c = (lookup!(kc, block, o) for o in ops)
-        op = vector.contract(
-            b, a, c;
-            result_0 = result(),
-            indexing_maps = opaque_attr(
-                "[affine_map<(d0, d1, d2) -> (d0, d2)>, \
-                 affine_map<(d0, d1, d2) -> (d2, d1)>, \
-                 affine_map<(d0, d1, d2) -> (d0, d1)>]"; context = ctx,
-            ),
-            iterator_types = opaque_attr(
-                "[#vector.iterator_type<parallel>, #vector.iterator_type<parallel>, \
-                 #vector.iterator_type<reduction>]"; context = ctx,
-            ),
-            kind = opaque_attr("#vector.kind<add>"; context = ctx),
-            location = loc(ctx),
-        )
-        push!(block, op)
-        kc.values[ssa] = IR.result(op, 1)
-        return nothing
-    end
-
-    float_op, int_op = VECTOR_OPS[fn]
-    builder = eltype(inst[:type]) <: AbstractFloat ? float_op : int_op
-    args = IR.Value[lookup!(kc, block, o) for o in ops]
-    op = builder(args...; result = result(), location = loc(ctx))
     push!(block, op)
     kc.values[ssa] = IR.result(op, 1)
     return nothing
 end
+
+function _emit_vstore!(kc, block, jblock, inst, fn, ops, ssa)
+    ctx = kc.ctx
+    value = lookup!(kc, block, ops[1])
+    tile = lookup!(kc, block, ops[2])
+    indices = subscripts!(kc, block, tile, @view ops[3:end])
+    vt = IRStructurizer.value_type(jblock, ops[1])
+    if vt <: Mat
+        # Symmetric to the `Mat` load: flatten back to 1-D before the `vector.store`.
+        R, C = size(vt)
+        flat = vector.shape_cast(
+            value; result = vector_type(ctx, Vec{R * C, eltype(vt)}), location = loc(ctx),
+        )
+        push!(block, flat)
+        value = IR.result(flat, 1)
+    end
+    push!(block, vector.store(value, tile, indices; location = loc(ctx)))
+    return nothing
+end
+
+function _emit_vbroadcast!(kc, block, jblock, inst, fn, ops, ssa)
+    ctx = kc.ctx
+    source = lookup!(kc, block, ops[2])
+    op = vector.broadcast(source; vector = _result(kc, inst), location = loc(ctx))
+    push!(block, op)
+    kc.values[ssa] = IR.result(op, 1)
+    return nothing
+end
+
+function _emit_vconvert!(kc, block, jblock, inst, fn, ops, ssa)
+    ctx = kc.ctx
+    result = () -> mlir_type(ctx, inst[:type])
+    # Element type first, value second, as with the scalar conversions.
+    source = lookup!(kc, block, ops[2])
+    from = eltype(IRStructurizer.value_type(jblock, ops[2]))
+    to = eltype(inst[:type])
+    from === to && return (kc.values[ssa] = source; nothing)
+    if to <: Signed && from <: Signed
+        builder = bitwidth(to) > bitwidth(from) ? arith.extsi : arith.truncsi
+    elseif to <: Unsigned && from <: Unsigned
+        builder = bitwidth(to) > bitwidth(from) ? arith.extui : arith.truncui
+    elseif to <: AbstractFloat && from <: AbstractFloat
+        builder = bitwidth(to) > bitwidth(from) ? arith.extf : arith.truncf
+    else
+        error("Unsupported vector conversion from $from to $to")
+    end
+    op = builder(source; out = result(), location = loc(ctx))
+    push!(block, op)
+    kc.values[ssa] = IR.result(op, 1)
+    return nothing
+end
+
+function _emit_vreinterpret!(kc, block, jblock, inst, fn, ops, ssa)
+    ctx = kc.ctx
+    # Element type first, value second, as with `vconvert`; a bitcast is a pure
+    # relabel of the same bits, so the result vector type carries all the change.
+    source = lookup!(kc, block, ops[2])
+    op = arith.bitcast(source; out = _result(kc, inst), location = loc(ctx))
+    push!(block, op)
+    kc.values[ssa] = IR.result(op, 1)
+    return nothing
+end
+
+function _emit_vexp!(kc, block, jblock, inst, fn, ops, ssa)
+    ctx = kc.ctx
+    # The hardware exp: `convert-vector-to-aievec` turns `math.exp` on a bf16
+    # vector into the AIE exp intrinsic (bf16 only -- see `vexp`).
+    source = lookup!(kc, block, ops[1])
+    op = math.exp(source; result = _result(kc, inst), location = loc(ctx))
+    push!(block, op)
+    kc.values[ssa] = IR.result(op, 1)
+    return nothing
+end
+
+function _emit_vreduce_add!(kc, block, jblock, inst, fn, ops, ssa)
+    ctx = kc.ctx
+    source = lookup!(kc, block, ops[1])
+    op = vector.reduction(
+        source; dest = _result(kc, inst), kind = IR.Attribute("add"; context = ctx),
+        location = loc(ctx),
+    )
+    push!(block, op)
+    kc.values[ssa] = IR.result(op, 1)
+    return nothing
+end
+
+function _emit_vfma!(kc, block, jblock, inst, fn, ops, ssa)
+    ctx = kc.ctx
+    result = () -> mlir_type(ctx, inst[:type])
+    a, b, c = (lookup!(kc, block, o) for o in ops)
+    if eltype(inst[:type]) <: AbstractFloat
+        op = vector.fma(a, b, c; result = result(), location = loc(ctx))
+        push!(block, op)
+    else
+        # vector.fma is floating-point only, so an integer multiply-accumulate
+        # is spelled out. The two ops fuse again downstream.
+        mul = arith.muli(a, b; result = result(), location = loc(ctx))
+        push!(block, mul)
+        op = arith.addi(
+            IR.result(mul, 1), c; result = result(), location = loc(ctx)
+        )
+        push!(block, op)
+    end
+    kc.values[ssa] = IR.result(op, 1)
+    return nothing
+end
+
+function _emit_vmatmul!(kc, block, jblock, inst, fn, ops, ssa)
+    ctx = kc.ctx
+    # Emit as `vector.contract` and let `convert-vector-to-aievec` lower to
+    # `aievec.matmul` (it also reconciles the surrounding casts). `Mat` is stored
+    # transposed (see `matrix_type`), so `a * b` is `contract(bt, at) = (a*b)t` into the
+    # equally-transposed output -- hence the swapped operands. Standard `(m,n,k)` gemm.
+    a, b, c = (lookup!(kc, block, o) for o in ops)
+    op = vector.contract(
+        b, a, c;
+        result_0 = _result(kc, inst),
+        indexing_maps = opaque_attr(
+            "[affine_map<(d0, d1, d2) -> (d0, d2)>, \
+             affine_map<(d0, d1, d2) -> (d2, d1)>, \
+             affine_map<(d0, d1, d2) -> (d0, d1)>]"; context = ctx,
+        ),
+        iterator_types = opaque_attr(
+            "[#vector.iterator_type<parallel>, #vector.iterator_type<parallel>, \
+             #vector.iterator_type<reduction>]"; context = ctx,
+        ),
+        kind = opaque_attr("#vector.kind<add>"; context = ctx),
+        location = loc(ctx),
+    )
+    push!(block, op)
+    kc.values[ssa] = IR.result(op, 1)
+    return nothing
+end
+
+# Elementwise arith over a vector type: `arith.mulf %a, %b : vector<8xf32>` becomes an
+# `aievec.mul_elem`. The float/int op comes from VECTOR_OPS.
+function _emit_velementwise!(kc, block, jblock, inst, fn, ops, ssa)
+    ctx = kc.ctx
+    float_op, int_op = VECTOR_OPS[fn]
+    builder = eltype(inst[:type]) <: AbstractFloat ? float_op : int_op
+    args = IR.Value[lookup!(kc, block, o) for o in ops]
+    op = builder(args...; result = _result(kc, inst), location = loc(ctx))
+    push!(block, op)
+    kc.values[ssa] = IR.result(op, 1)
+    return nothing
+end
+
+for (f, emit) in (vload => _emit_vload!, vstore! => _emit_vstore!,
+                  vbroadcast => _emit_vbroadcast!, vconvert => _emit_vconvert!,
+                  vreinterpret => _emit_vreinterpret!, vexp => _emit_vexp!,
+                  vreduce_add => _emit_vreduce_add!, vfma => _emit_vfma!,
+                  vmatmul => _emit_vmatmul!)
+    VECTOR_EMITTERS[f] = emit
+end
+for f in keys(VECTOR_OPS)
+    VECTOR_EMITTERS[f] = _emit_velementwise!
+end
+
+emit_vector!(kc::KernelContext, block::IR.Block, jblock, inst, fn, ops, ssa) =
+    VECTOR_EMITTERS[fn](kc, block, jblock, inst, fn, ops, ssa)
 
 function emit_call!(kc::KernelContext, block::IR.Block, jblock, inst)
     resolved = IRStructurizer.resolve_call(jblock, inst)
@@ -393,8 +425,7 @@ function emit_call!(kc::KernelContext, block::IR.Block, jblock, inst)
         return emit_convert!(kc, block, ssa, source, from, inst[:type])
     end
 
-    if fn in (vload, vstore!, vbroadcast, vreduce_add, vfma, vmatmul, vconvert, vreinterpret, vexp) ||
-            haskey(VECTOR_OPS, fn)
+    if haskey(VECTOR_EMITTERS, fn)
         return emit_vector!(kc, block, jblock, inst, fn, ops, ssa)
     end
 
