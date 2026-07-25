@@ -240,17 +240,27 @@ end
 # Tile placement here assumes the shape of the reference design: a single worker,
 # with every FIFO running between the host and that one core. Anything else needs a
 # real placement story, so say so plainly instead of emitting a subtly wrong module.
+# Every FIFO must have exactly one producer and at least one consumer, counting both worker
+# endpoints (a compute core) and host transfers (a shim). This is what lets a design span
+# several chained workers with core-to-core FIFOs between them -- a streaming pipeline --
+# not just one worker fed and drained by the host.
 function check_supported(p::Program)
-    length(p.runtime.workers) == 1 || error(
-        "IRON: expected exactly one worker, got $(length(p.runtime.workers)); \
-        multi-worker designs are not supported yet"
-    )
     for fifo in fifos(p)
-        n = count(t -> t.endpoint.fifo.name == fifo.name, p.runtime.transfers)
-        n == 1 || error(
-            "IRON: object FIFO \"$(fifo.name)\" has $n host transfers, expected exactly \
-            one; core-to-core FIFOs are not supported yet"
-        )
+        producers = consumers = 0
+        for w in p.runtime.workers, ep in w.endpoints
+            ep.fifo.name == fifo.name || continue
+            ep.port === Produce ? (producers += 1) : (consumers += 1)
+        end
+        for t in p.runtime.transfers
+            t.endpoint.fifo.name == fifo.name || continue
+            t.endpoint.port === Produce ? (producers += 1) : (consumers += 1)
+        end
+        producers == 1 || error(
+            "IRON: object FIFO \"$(fifo.name)\" has $producers producers, expected exactly \
+            one (a worker that writes it, or a host `fill!`)")
+        consumers >= 1 || error(
+            "IRON: object FIFO \"$(fifo.name)\" has no consumer (a worker that reads it, or \
+            a host `drain!`)")
     end
     return nothing
 end
@@ -269,11 +279,32 @@ The upstream ops print with their custom assembly, while the `aie` ops print in
 generic form because this context does not have the dialect registered. `aie-opt`,
 which does, accepts either.
 """
+# The producer tile and consumer tiles a FIFO wires together, gathered from the worker
+# endpoints that hold it and any host transfer on it: a worker's producer/consumer endpoint
+# is its compute core, a host `fill!` is the shim (producer), a `drain!` the shim
+# (consumer). An inter-core FIFO has no host transfer and so no shim.
+function _fifo_tiles(p::Program, name::AbstractString, core_tiles, shim_tiles)
+    producer = nothing
+    consumers = IR.Value[]
+    for (w, tile) in zip(p.runtime.workers, core_tiles)
+        for ep in w.endpoints
+            ep.fifo.name == name || continue
+            ep.port === Produce ? (producer = tile) : push!(consumers, tile)
+        end
+    end
+    for t in p.runtime.transfers
+        t.endpoint.fifo.name == name || continue
+        t.endpoint.port === Produce ? (producer = shim_tiles[name]) : push!(consumers, shim_tiles[name])
+    end
+    return producer, consumers
+end
+
 function generate_mlir(p::Program; canonicalize::Bool = true, ctx::IR.Context = context())
     check_supported(p)
     device_body = IR.Block(IR.Type[], IR.Location[])
 
-    # One compute tile per worker, plus a shim tile per host transfer.
+    # One compute tile per worker, plus a shim tile per host transfer (an `In`/`Out` FIFO).
+    # Inter-core FIFOs move on-chip and get no shim.
     core_tiles = IR.Value[]
     for _ in p.runtime.workers
         tile = logical_tile_op(ctx, CoreTile)
@@ -287,18 +318,13 @@ function generate_mlir(p::Program; canonicalize::Bool = true, ctx::IR.Context = 
         shim_tiles[t.endpoint.fifo.name] = IR.result(tile, 1)
     end
 
-    # A FIFO runs shim->core when the host fills it and core->shim when the host
-    # drains it, so the shim sits at whichever end the host is not.
+    # Wire each FIFO between its producer and consumers -- shim<->core for a host transfer,
+    # core->core for an activation streamed between two chained workers.
     for fifo in fifos(p)
-        shim = shim_tiles[fifo.name]
-        core = only(core_tiles)
-        host_port = only(
-            t.endpoint.port for t in p.runtime.transfers if t.endpoint.fifo.name == fifo.name
-        )
-        producer, consumer = host_port === Produce ? (shim, core) : (core, shim)
+        producer, consumers = _fifo_tiles(p, fifo.name, core_tiles, shim_tiles)
         push!(
             device_body, objectfifo_op(
-                ctx, fifo.name, producer, IR.Value[consumer],
+                ctx, fifo.name, producer, consumers,
                 objectfifo_type(ctx, tiletype(fifo)), fifo.depth,
             )
         )

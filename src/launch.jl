@@ -311,10 +311,13 @@ macro iron(exprs...)
         push!(kws, Expr(:kw, opt.args[1], esc(opt.args[2])))
     end
 
-    # A `for` target is a tiled reduction schedule; anything else must be a call.
+    # A `for` target is a tiled reduction schedule; a `begin` block is a streaming pipeline
+    # of stages; anything else must be a single kernel call.
     Meta.isexpr(target, :for) && return _build_iron_schedule(target, kws)
+    Meta.isexpr(target, :block) && return _build_iron_pipeline(target, kws)
     Meta.isexpr(target, :call) || error(
-        "@iron: expected a kernel call `kernel(In(a), Out(b))` or a `for` schedule, got `$target`"
+        "@iron: expected a kernel call `kernel(In(a), Out(b))`, a `for` schedule, or a \
+        `begin ... end` pipeline, got `$target`"
     )
 
     kernel = target.args[1]
@@ -328,4 +331,93 @@ macro iron(exprs...)
         end
     end
     return Expr(:call, _iron_launch, esc(kernel), Expr(:tuple, kernel_args...), kws...)
+end
+
+# --- `@iron begin ... end` streaming pipeline --------------------------------
+# Each statement `out = kernel(args...)` is one stage on its own compute core. `In(x)` reads
+# a host buffer and `Out(y)` writes one; a bare on-chip stream (a plain variable) produced by
+# one stage and consumed by the next becomes a core-to-core object FIFO, so the intermediate
+# activations never touch DDR. The stages are lowered to a multi-worker `Program`.
+
+# `In(x)` -> (:in, x) host input; a bare `x` -> (:chan, x) on-chip stream from another stage.
+function _pipe_input(a)
+    Meta.isexpr(a, :call) && a.args[1] === :In && return Expr(:tuple, QuoteNode(:in), esc(a.args[2]))
+    a isa Symbol && return Expr(:tuple, QuoteNode(:chan), esc(a))
+    error("@iron: a pipeline stage input must be `In(x)` or an on-chip stream variable, got `$a`")
+end
+
+# `Out(y)` -> (:out, y) host output; a bare `y` -> (:chan, y) on-chip stream to another stage.
+function _pipe_output(lhs)
+    Meta.isexpr(lhs, :call) && lhs.args[1] === :Out && return Expr(:tuple, QuoteNode(:out), esc(lhs.args[2]))
+    lhs isa Symbol && return Expr(:tuple, QuoteNode(:chan), esc(lhs))
+    error("@iron: a pipeline stage output must be `Out(y)` or an on-chip stream variable, got `$lhs`")
+end
+
+function _build_iron_pipeline(block, kws)
+    stages = Expr[]
+    for stmt in block.args
+        stmt isa LineNumberNode && continue
+        Meta.isexpr(stmt, :(=)) || error(
+            "@iron: each pipeline stage must be `out = kernel(inputs...)`, got `$stmt`")
+        lhs, call = stmt.args
+        # `Out(y) = f(...)` parses as a short function definition, wrapping the call in a
+        # block; `x = f(...)` gives the call directly. Unwrap the block form.
+        if Meta.isexpr(call, :block)
+            calls = filter(s -> !(s isa LineNumberNode), call.args)
+            length(calls) == 1 || error("@iron: a pipeline stage is a single kernel call, got `$stmt`")
+            call = only(calls)
+        end
+        Meta.isexpr(call, :call) || error(
+            "@iron: each pipeline stage must be `out = kernel(inputs...)`, got `$stmt`")
+        inputs = map(_pipe_input, call.args[2:end])
+        push!(stages, Expr(:tuple, esc(call.args[1]), Expr(:tuple, inputs...), _pipe_output(lhs)))
+    end
+    isempty(stages) && error("@iron: the pipeline has no stages")
+    return Expr(:call, _pipeline_launch, Expr(:tuple, stages...), kws...)
+end
+
+# The runtime behind the pipeline form. Builds a multi-worker `Program`: one `Worker` per
+# stage, an object FIFO per stream (keyed by the buffer's identity so the same on-chip stream
+# links its producer and consumer stages), and host `fill!`/`drain!` for the `In`/`Out`
+# buffers only. Compiles once per distinct shape and runs it on the host buffers in place.
+function _pipeline_launch(
+    stages::Tuple;
+    device::AIEDevice = npu2, name::AbstractString = "main",
+    flags::AbstractVector{<:AbstractString} = String[], verbose::Bool = false,
+    stack_size::Integer = 1024,
+)
+    rt = Runtime()
+    fifo_of = IdDict{Any, ObjectFifo}()   # buffer identity -> its object FIFO
+    arg_of = IdDict{Any, Int}()           # host buffer -> its sequence-argument index
+    host_args = NPUArray[]                 # host buffers in sequence-argument order
+
+    getfifo!(arr) = get!(() -> ObjectFifo{kernelconvert(arr)}("fifo$(length(fifo_of) + 1)"), fifo_of, arr)
+    host_arg!(arr) = get!(() -> (push!(host_args, arr); length(host_args)), arg_of, arr)
+
+    for (kernel, inputs, output) in stages
+        endpoints = Endpoint[]
+        for (role, arr) in inputs
+            fifo = getfifo!(arr)
+            push!(endpoints, consumer(fifo))
+            role === :in && fill!(rt, producer(fifo), host_arg!(arr))
+        end
+        orole, oarr = output
+        ofifo = getfifo!(oarr)
+        push!(endpoints, producer(ofifo))
+        orole === :out && drain!(rt, consumer(ofifo), host_arg!(oarr))
+        start!(rt, Worker(kernel, endpoints; stack_size))
+    end
+
+    argtypes = Type[kernelconvert(a) for a in host_args]
+    # Key on the stage kernels and every stream's role + tile type (in stage order), so a
+    # repeated launch of the same pipeline reuses its xclbin.
+    key = (
+        Tuple(typeof(k) for (k, _, _) in stages),
+        Tuple((r, kernelconvert(a)) for (_, ins, _) in stages for (r, a) in ins),
+        Tuple((r, kernelconvert(a)) for (_, _, (r, a)) in stages),
+        device, String(name), Tuple(flags), Int(stack_size),
+    )
+    compiled = get!(() -> compile(Program(device, rt, argtypes; name); flags, verbose), _LAUNCH_CACHE, key)
+    run!(compiled, host_args...)
+    return compiled
 end
