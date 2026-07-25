@@ -254,7 +254,7 @@ function _iron_launch(
         # case of a tiled map (its tile is the whole buffer), so `_build_tiled_program`
         # handles it with a single grid coordinate and one transfer per buffer.
         mlir = _build_tiled_program(kernel, dirs, buffer_types, tile_types, device, name; stack_size)
-        compile(mlir, dirs; flags, verbose)
+        compile(mlir, collect(dirs); flags, verbose)
     end
 
     run!(compiled, arrays...)
