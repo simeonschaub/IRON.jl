@@ -42,12 +42,9 @@ end
 
 NPUArray{T}(u::UndefInitializer, dims::Integer...) where {T} = NPUArray{T}(u, map(Int, dims))
 
-function NPUArray{T}(::UndefInitializer, dims::Dims{N}) where {T, N}
-    a = _npu_empty(T, dims)
-    fill!(a.data, zero(T))
-    _bo_sync_to_device(a.bo)
-    return a
-end
+# Genuinely uninitialized: no zero-fill, no sync. Outputs are overwritten by the launch,
+# and an input is filled by the caller (`NPUArray(A)`, indexing, or `copyto!`).
+NPUArray{T}(::UndefInitializer, dims::Dims{N}) where {T, N} = _npu_empty(T, dims)
 
 # Allocate a buffer shaped like a kernel tile, the common case for a design output.
 NPUArray{T}(u::UndefInitializer, ::Type{Tile{T, Dims}}) where {T, Dims} =
