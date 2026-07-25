@@ -48,25 +48,6 @@ _group_id(kernel, argno::Integer) = XRT.XRTWrap.group_id(kernel, Cint(argno))
 # bound turns that into an error. Override for a genuinely slow design.
 const RUN_TIMEOUT_MS = parse(UInt32, get(ENV, "IRON_RUN_TIMEOUT_MS", "120000"))
 
-# Launch: the fixed NPU argument layout is opcode (3), instruction BO, instruction
-# word count, then the data BOs in order. Scalars go as 64-bit; XRT copies only as
-# many bytes as the kernel's argument declares.
-function _run(kernel, instr::Bo, ninstr::Integer, args::Vector{Bo})
-    run = XRT.Run(kernel)
-    XRT.set_arg!(run, 0, UInt64(3))
-    XRT.set_arg!(run, 1, instr)
-    XRT.set_arg!(run, 2, UInt64(ninstr))
-    for (i, bo) in enumerate(args)
-        XRT.set_arg!(run, 2 + i, bo)
-    end
-    XRT.start(run)
-    state = XRT.wait(run, RUN_TIMEOUT_MS)
-    state == XRT.XRTWrap.ErtCmdState.COMPLETED || error(
-        "IRON: NPU launch did not complete (state=$state) within $(RUN_TIMEOUT_MS) ms; the \
-         design likely deadlocked on the NPU. Raise IRON_RUN_TIMEOUT_MS if it is merely slow.")
-    return nothing
-end
-
 # --- process-wide device -----------------------------------------------------
 # One device handle, opened on first use and shared by every buffer and launch --
 # the way MLIR-AIE's Python runtime keeps a single `pyxrt.device(0)`. It lives for
@@ -116,6 +97,7 @@ mutable struct CompiledProgram
     hwctx::Union{XRT.XRTWrap.HwContext, Nothing}
     kernel::Union{XRT.XRTWrap.Kernel, Nothing}
     instr_bo::Union{Bo, Nothing}
+    run::Union{XRT.XRTWrap.Run, Nothing}  # cached; the fixed opcode/instr/count args set once
 end
 
 # Load the raw little-endian UInt32 instruction stream aiecc emits.
@@ -151,7 +133,7 @@ function compile(
     mlir_file = path === nothing ? joinpath(workdir, "aie.mlir") : String(path)
     write(mlir_file, mlir)
     xclbin, insts = aiecc_compile(mlir_file; workdir, peano, flags, verbose)
-    return CompiledProgram(Int(nargs), xclbin, _load_insts(insts), nothing, nothing, nothing, nothing)
+    return CompiledProgram(Int(nargs), xclbin, _load_insts(insts), nothing, nothing, nothing, nothing, nothing)
 end
 
 compile(p::Program; kwargs...) = compile(generate_mlir(p), length(p.argtypes); kwargs...)
@@ -179,6 +161,20 @@ function _instr_bo!(c::CompiledProgram, kernel)
     return c.instr_bo
 end
 
+# The launch's `xrt::run`, built once and re-used. The fixed NPU argument layout is
+# opcode (3), instruction BO, instruction word count, then the data BOs; only the first
+# three are constant, so set them here and leave the data BOs to each launch.
+function _run!(c::CompiledProgram, kernel, instr::Bo)
+    if c.run === nothing
+        run = XRT.Run(kernel)
+        XRT.set_arg!(run, 0, UInt64(3))
+        XRT.set_arg!(run, 1, instr)
+        XRT.set_arg!(run, 2, UInt64(length(c.insts)))
+        c.run = run
+    end
+    return c.run
+end
+
 """
     run!(compiled, arrays...) -> nothing
 
@@ -195,17 +191,23 @@ function run!(c::CompiledProgram, arrays::NPUArray...)
     )
     kernel = _kernel!(c)
     instr = _instr_bo!(c, kernel)
+    run = _run!(c, kernel, instr)
 
-    # The design's resident buffers, in argument order. Flush each to the device
-    # (inputs may have been written since the last sync), launch, then pull each
-    # back so a host read sees the design's output.
-    bos = Bo[buffer(a) for a in arrays]
-    for bo in bos
+    # Flush each resident buffer to the device (inputs may have been written since the last
+    # sync) and bind it as the next data argument, launch, then pull each back so a host
+    # read sees the design's output.
+    for (i, a) in enumerate(arrays)
+        bo = buffer(a)
         _bo_sync_to_device(bo)
+        XRT.set_arg!(run, 2 + i, bo)
     end
-    _run(kernel, instr, length(c.insts), bos)
-    for bo in bos
-        _bo_sync_from_device(bo)
+    XRT.start(run)
+    state = XRT.wait(run, RUN_TIMEOUT_MS)
+    state == XRT.XRTWrap.ErtCmdState.COMPLETED || error(
+        "IRON: NPU launch did not complete (state=$state) within $(RUN_TIMEOUT_MS) ms; the \
+         design likely deadlocked on the NPU. Raise IRON_RUN_TIMEOUT_MS if it is merely slow.")
+    for a in arrays
+        _bo_sync_from_device(buffer(a))
     end
     return nothing
 end
