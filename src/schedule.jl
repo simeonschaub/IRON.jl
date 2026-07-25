@@ -196,7 +196,13 @@ function _emit_schedule_core!(ctx::IR.Context, @nospecialize(init), @nospecializ
     index = IR.IndexType(; context = ctx)
     const_(v) = (op = arith.constant(; value = IR.Attribute(v, index), location = loc(ctx)); push!(body, op); IR.result(op, 1))
     c0, c1 = const_(0), const_(1)
-    cspace, creduce = const_(num_outer), const_(num_reduce)
+    # The outer (space) loop runs forever, like the map core's loop -- each launch's runtime
+    # sequence feeds exactly `num_outer` output tiles and then the core blocks on the next
+    # acquire, so a re-launch is simply more tiles. A bounded loop would run once and exit,
+    # leaving a finished core that the next launch deadlocks feeding. `num_outer` stays the
+    # host-side feed count (see `_emit_schedule_runtime!`); the core just consumes in order.
+    creduce = const_(num_reduce)
+    cspace = const_(typemax(Int))
 
     inputs = [s for s in specs if s.dir === :in]
     outputs = [s for s in specs if s.dir === :out]
