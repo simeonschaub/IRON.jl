@@ -1,34 +1,14 @@
-# A high-level launch front end: describe a single-core design by the kernel and
-# the buffers it runs on, and let IRON wire up the object FIFOs, the worker, the
-# host DMA and the compile/run cycle -- the way `@cuda kernel(a, b, c)` hides the
-# grid/stream machinery of a CUDA launch.
+# The `@iron` call form: a single-core design described by its kernel and buffers, on
+# top of the `Program`/`Worker`/`Runtime` layer in `dataflow.jl`. Two shapes: whole-buffer
+# (each NPUArray is one tile, kernel runs once -- the `add_one` case) and tiled *map*
+# (each NPUArray splits into the *same* grid, the kernel runs once per corresponding tile).
+# Reductions like GEMM -- output tile held across an inner operand-streaming loop -- can't
+# be read off the kernel and use `@iron`'s `for` form instead (see `schedule.jl`).
 #
-# This sits on top of the `Program`/`Worker`/`Runtime` layer in `dataflow.jl`. It
-# targets a single compute tile with one host transfer stream per buffer. Two shapes
-# are supported:
-#
-#   * whole-buffer (the default): each NPUArray moves as a single tile, the kernel
-#     runs once -- the elementwise/whole-array case (`add_one`).
-#   * tiled *map*: each NPUArray splits into a grid of tiles, streamed one at a time,
-#     and the kernel runs once per tile. All buffers must split into the *same* grid,
-#     so the k-th tile of each corresponds; the kernel sees one tile from each buffer
-#     per step. This is the SIMT-in-spirit case -- write the per-tile kernel, and the
-#     launch drives it over the tile grid, much as a CUDA grid runs a thread block per
-#     chunk.
-#
-# What this call form deliberately does NOT cover is a *reduction* like GEMM, where the
-# output tile is held across an inner loop that streams the input operands at a
-# different rate and accumulates -- and where each operand's tile is indexed by a
-# different combination of the loop variables. That schedule cannot be read off the
-# kernel; it is spelled out with `@iron`'s `for` form (see `schedule.jl`).
-#
-# Unlike a GPU, where every argument is just resident memory the kernel reads and
-# writes at will, an AIE buffer streams through a *unidirectional* object FIFO: it
-# is either fed host->core (an input the kernel reads) or drained core->host (an
-# output the kernel writes). That direction is the one thing the front end cannot
-# guess, so each argument is tagged with [`In`](@ref) or [`Out`](@ref) at the call
-# site. The tile shape, when a buffer is streamed in more than one piece, is given by
-# a type annotation -- `In(a)::Tile{T,Dims}` -- read like a typeassert.
+# An AIE buffer streams through a *unidirectional* object FIFO: fed host->core (input) or
+# drained core->host (output). The front end can't guess that direction, so each argument
+# is tagged [`In`](@ref)/[`Out`](@ref); a multi-tile buffer's tile shape is given as a
+# type annotation, `In(a)::Tile{T,Dims}`.
 
 """
     In(a::NPUArray)

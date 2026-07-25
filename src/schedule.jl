@@ -1,48 +1,20 @@
-# The tiled-*reduction* schedule behind `@iron`'s `for` form -- the shape `@iron`'s
-# call form cannot infer. A GEMM is the archetype: an output tile is held across an
-# inner loop that streams the input operands and accumulates into it, and each
-# operand's tile is addressed by a different mix of the loop variables. That schedule
-# is not visible in the kernels, so it is written as a `for` loop -- the header is the
-# output-tile iteration (the space axes) and the body declares the operands and the
-# reduction:
+# The tiled-*reduction* schedule behind `@iron`'s `for` form (a GEMM is the archetype):
+# an output tile held across an inner loop that streams the input operands and
+# accumulates into it, each operand's tile addressed by a different mix of the loop
+# variables. See the `@iron` docstring for the surface syntax.
 #
-#     @iron stack_size = 3328 for mi in 1:div(M, m), nj in 1:div(N, n)   # output-tile (space) loop
-#         @init gemm_zero!(C)                                    # zero the accumulator, once per tile
-#         @reduce for kk in 1:div(K, k)                          # the accumulation (reduce) loop
-#             gemm_acc!(In(A)[mi, kk], In(B)[kk, nj], Out(C)[mi, nj])  # step: C += A*B, each operand's
-#         end                                                    #   [axes] indexing its tile in buffer order
-#     end
+# A tile shape is never annotated -- it follows from the buffer shape and the extents of
+# the axes indexing it: buffer dimension of extent `D` indexed by an axis of extent `E`
+# gives a tile extent `D ÷ E`.
 #
-# The generated design is the classic tiled-GEMM loop nest: the core acquires and
-# initialises the output tiles in the outer (space) loop and acquires the inputs and
-# reduces into them in the inner (reduce) loop, while the host DMA streams, per output
-# tile, the reduction's input tiles and then drains the output. A tile shape is not
-# annotated -- it follows from the buffer shape and the extents of the axes indexing
-# it: buffer dimension `d` of extent `D`, indexed by an axis of extent `E`, gives a
-# tile extent `D ÷ E`.
-#
-# `@cores <axis>` spreads a space axis across the compute-core array: that axis becomes
-# *spatial* (one output-tile position per core, run concurrently) while the remaining
-# space axes stay *temporal* (each core iterates them itself). One core reduces its own
-# output tiles exactly as the single-core design does; the host DMA feeds every core per
-# temporal step so they run in parallel:
-#
-#     @iron for mi in 1:div(M, m), nj in 1:div(N, n)
-#         @cores nj                                     # nj -> the core array
-#         @init gemm_zero!(C)
-#         @reduce for kk in 1:div(K, k); gemm_acc!(...); end
-#     end
-#
-# Each core gets its own shim tile hosting its operand FIFOs, so the design uses one shim
-# per core. That bounds this scheme to the device's shim columns (about 8 on npu2):
-# feeding more cores than there are shim tiles would force several cores onto one shim,
-# which does not have a DMA channel per core to spare. Scaling to the full array needs the
-# L2/MemTile relay (a later increment), which fans out to the cores on-chip.
+# `@cores <axis>` makes a space axis *spatial* (one output-tile position per core, run
+# concurrently); the remaining space axes stay temporal. Each core gets its own shim
+# tile, so this scheme is bounded by the device's shim columns (~8 on npu2); scaling to
+# the full array needs the L2/MemTile relay (a later increment).
 
-# Object FIFO depth: how many tiles the shim may buffer ahead of the core -- so it is also
-# the ping-pong / compute-DMA-overlap depth (>= 2 double-buffers each FIFO) and the ceiling
-# on in-flight host DMA buffer descriptors per operand (see `_emit_schedule_runtime!`), which
-# is why it must stay well under the 16-BD-per-tile hardware limit.
+# Object FIFO depth: tiles the shim may buffer ahead of the core, so also the
+# compute/DMA overlap depth (>=2 to double-buffer) and the in-flight-BD count per operand,
+# which must stay under the 16-BD-per-tile hardware limit.
 const FIFO_DEPTH = 2
 
 # The launch behind the `for` form. `space`/`reduction` are tuples of `(name, extent)`;
@@ -325,15 +297,10 @@ function _emit_schedule_runtime!(ctx::IR.Context, specs, spatial, temporal, redu
     core_coords = _axis_coords(spatial)   # one spatial coordinate per core
     groups = _core_groups(num_cores)
 
-    # Ping-pong / compute-DMA overlap. One sliding window of in-flight tasks per FIFO -- per
-    # (operand, core) for direct in/out, per (operand, group) for the shared broadcast/
-    # distribute/join ones -- carried ACROSS the temporal (output-tile) steps rather than
-    # drained at each one. A FIFO's oldest task is retired (await + free) only once
-    # `FIFO_DEPTH` newer ones are queued on it; the object FIFO backpressures the shim to at
-    # most `FIFO_DEPTH` tiles ahead, so by then the oldest has drained. Because the windows
-    # span tiles, one tile's output drain overlaps the next tile's input feed + compute
-    # instead of blocking it. Peak in-flight per FIFO stays `FIFO_DEPTH` (a tile holds at most
-    # 16 BDs), and the issue order per FIFO is unchanged -- only the await points move.
+    # Ping-pong: one FIFO_DEPTH-deep window of in-flight tasks per FIFO, carried across the
+    # temporal steps rather than drained at each -- a FIFO's oldest task is retired only once
+    # FIFO_DEPTH newer ones are queued, so one tile's output drain overlaps the next tile's
+    # feed + compute. Keyed per (operand, core), or per (operand, group) for the shared ones.
     inflight = Dict{Any, Vector{IR.Value}}()
     outflight = Dict{Any, Vector{IR.Value}}()
     for i in bcast_in
@@ -641,19 +608,9 @@ function _build_schedule_program(
 end
 
 # --- `@iron for` front end ---------------------------------------------------
-# Turns the `for` form of `@iron` (parsed in `launch.jl`) into a `_schedule_launch`
-# call. The outer `for` header gives the space (output-tile) axes; the body holds an
-# optional `@init` and the reduction, written as a nested `@reduce for` loop whose own
-# header is the reduction axes and whose body is the step call:
-#
-#     @iron for mi in 1:div(M, m), nj in 1:div(N, n)
-#         @init gemm_zero!(C)
-#         @reduce for kk in 1:div(K, k)
-#             gemm_acc!(In(A)[mi, kk], In(B)[kk, nj], Out(C)[mi, nj])
-#         end
-#     end
-#
-# A design with no reduction writes the step call directly in the space body instead.
+# Turns the `for` form of `@iron` (parsed in `launch.jl`) into a `_schedule_launch` call:
+# the outer `for` header is the space (output-tile) axes, the body an optional `@init`
+# and a `@reduce for` reduction (or, with no reduction, the step call directly).
 
 # `[(:name, extent_expr), ...]` for the space or reduction axes.
 _axes_to_expr(axes) = Expr(:tuple, [Expr(:tuple, QuoteNode(nm), esc(ex)) for (nm, ex) in axes]...)
