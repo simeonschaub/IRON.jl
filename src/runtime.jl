@@ -87,7 +87,7 @@ the first [`run!`](@ref) and reused thereafter; they are released with the
 `CompiledProgram` by the garbage collector.
 """
 mutable struct CompiledProgram
-    nargs::Int  # number of runtime-sequence buffers the design takes
+    dirs::Vector{Symbol}  # :in / :out per runtime-sequence buffer, in argument order
     xclbin::String
     insts::Vector{UInt32}
     # The launch context and instruction buffer, opened lazily on the first run! and
@@ -111,18 +111,19 @@ end
 """
     compile(program; path=nothing, workdir=mktempdir(), flags=String[], verbose=false)
         -> CompiledProgram
-    compile(mlir::AbstractString, nargs; kwargs...) -> CompiledProgram
+    compile(mlir::AbstractString, dirs; kwargs...) -> CompiledProgram
 
 Compile a design to an NPU xclbin + instruction stream with `aiecc`/Peano, and wrap
 the result. The first form generates `program`'s MLIR; the second takes MLIR text
-directly together with `nargs`, the number of runtime-sequence buffers it takes.
+directly together with `dirs`, the `:in`/`:out` direction of each runtime-sequence
+buffer in argument order.
 `path`, if given, is where the `.mlir` is written; otherwise it goes under `workdir`.
 `flags` are passed through to `aiecc` (e.g. `["--alloc-scheme=basic-sequential"]`).
 `peano` overrides the Peano/llvm-aie install used for per-core codegen and linking
 (see [`aiecc_compile`](@ref)).
 """
 function compile(
-    mlir::AbstractString, nargs::Integer;
+    mlir::AbstractString, dirs::AbstractVector;
     path::Union{Nothing, AbstractString} = nothing,
     workdir::AbstractString = mktempdir(),
     peano::AbstractString = AIE_LLVM_Toolchain_jll.artifact_dir,
@@ -133,10 +134,20 @@ function compile(
     mlir_file = path === nothing ? joinpath(workdir, "aie.mlir") : String(path)
     write(mlir_file, mlir)
     xclbin, insts = aiecc_compile(mlir_file; workdir, peano, flags, verbose)
-    return CompiledProgram(Int(nargs), xclbin, _load_insts(insts), nothing, nothing, nothing, nothing, nothing)
+    return CompiledProgram(Symbol[dirs...], xclbin, _load_insts(insts), nothing, nothing, nothing, nothing, nothing)
 end
 
-compile(p::Program; kwargs...) = compile(generate_mlir(p), length(p.argtypes); kwargs...)
+compile(p::Program; kwargs...) = compile(generate_mlir(p), _program_dirs(p); kwargs...)
+
+# Per-argument :in/:out for a Program, read off the runtime's host transfers: a host
+# producer feeds a FIFO (input), a host consumer drains one (output).
+function _program_dirs(p::Program)
+    dirs = Vector{Symbol}(undef, length(p.argtypes))
+    for t in p.runtime.transfers
+        dirs[t.arg] = t.endpoint.port === Produce ? :in : :out
+    end
+    return dirs
+end
 
 # Open the kernel on first use and cache it. The XRT objects are released with the
 # CompiledProgram by the GC, so there is no finalizer to register.
@@ -186,19 +197,19 @@ the host with `Array`.
 The first call opens the device and loads the xclbin; later calls reuse them.
 """
 function run!(c::CompiledProgram, arrays::NPUArray...)
-    length(arrays) == c.nargs || error(
-        "IRON: design takes $(c.nargs) buffers, got $(length(arrays))"
+    length(arrays) == length(c.dirs) || error(
+        "IRON: design takes $(length(c.dirs)) buffers, got $(length(arrays))"
     )
     kernel = _kernel!(c)
     instr = _instr_bo!(c, kernel)
     run = _run!(c, kernel, instr)
 
-    # Flush each resident buffer to the device (inputs may have been written since the last
-    # sync) and bind it as the next data argument, launch, then pull each back so a host
-    # read sees the design's output.
-    for (i, a) in enumerate(arrays)
+    # An AIE FIFO is unidirectional, so a buffer only moves the way its argument does:
+    # flush an input to the device before the launch, read an output back after. Every
+    # buffer is bound as an argument regardless.
+    for (i, (a, dir)) in enumerate(zip(arrays, c.dirs))
         bo = buffer(a)
-        _bo_sync_to_device(bo)
+        dir === :in && _bo_sync_to_device(bo)
         XRT.set_arg!(run, 2 + i, bo)
     end
     XRT.start(run)
@@ -206,8 +217,8 @@ function run!(c::CompiledProgram, arrays::NPUArray...)
     state == XRT.XRTWrap.ErtCmdState.COMPLETED || error(
         "IRON: NPU launch did not complete (state=$state) within $(RUN_TIMEOUT_MS) ms; the \
          design likely deadlocked on the NPU. Raise IRON_RUN_TIMEOUT_MS if it is merely slow.")
-    for a in arrays
-        _bo_sync_from_device(buffer(a))
+    for (a, dir) in zip(arrays, c.dirs)
+        dir === :out && _bo_sync_from_device(buffer(a))
     end
     return nothing
 end

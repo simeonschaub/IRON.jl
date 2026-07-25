@@ -168,7 +168,7 @@ function _schedule_launch(
     )
     compiled = get!(_LAUNCH_CACHE, key) do
         mlir = _build_schedule_program(init, step, specs, spatial, temporal, reduction, device, name, Int(stack_size))
-        compile(mlir, length(specs); flags, verbose)
+        compile(mlir, [s.dir for s in specs]; flags, verbose)
     end
 
     run!(compiled, (s.array for s in specs)...)

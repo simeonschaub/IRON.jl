@@ -259,7 +259,7 @@ function _iron_launch(
             compile(_build_program(kernel, dirs, arrays, device, name); flags, verbose)
         else
             mlir = _build_tiled_program(kernel, dirs, buffer_types, tile_types, device, name; stack_size)
-            compile(mlir, length(args); flags, verbose)
+            compile(mlir, dirs; flags, verbose)
         end
     end
 
