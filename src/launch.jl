@@ -40,15 +40,13 @@ Out(a::NPUArray) = Out(a, nothing)
 
 const IOArg = Union{In, Out}
 
-_array(x::In) = x.array
-_array(x::Out) = x.array
+_array(x::IOArg) = x.array
 _dir(::In) = :in
 _dir(::Out) = :out
 
 # The tile the kernel sees for this argument: the explicit annotation if given, else
 # the whole buffer (a one-tile stream).
-_tile_of(x::In) = x.tile === nothing ? kernelconvert(x.array) : x.tile
-_tile_of(x::Out) = x.tile === nothing ? kernelconvert(x.array) : x.tile
+_tile_of(x::IOArg) = x.tile === nothing ? kernelconvert(x.array) : x.tile
 
 # `In(a)::T` / `Out(a)::T` reach the launch already constructed, so the annotation is
 # folded into a fresh wrapper carrying the tile type. `T` must be a `Tile{...}`.
