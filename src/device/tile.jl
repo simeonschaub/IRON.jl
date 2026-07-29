@@ -24,8 +24,15 @@ that the kernel compiler rewrites into `memref.load`/`memref.store`.
 Indexing is 1-based as everywhere else in Julia, and takes one subscript per
 dimension; the compiler subtracts the offset when lowering to the underlying
 0-based memref.
+
+A tile is `mutable` although it has no fields, and deliberately so: it is a *reference* to
+a buffer, and it must have identity. An immutable field-less struct is a singleton type,
+which means inference knows the value of anything typed `Tile{T,Dims}` exactly, and would
+constant-fold the result of an [`acquire!`](@ref) into a literal -- severing the SSA edge
+from the acquire to its uses, so a kernel called on it would load from nowhere. Identity is
+what keeps two acquires of two different FIFOs two different values.
 """
-struct Tile{T, Dims} end
+mutable struct Tile{T, Dims} end
 
 Base.eltype(::Type{Tile{T, Dims}}) where {T, Dims} = T
 Base.size(::Type{Tile{T, Dims}}) where {T, Dims} = tuple(Dims.parameters...)

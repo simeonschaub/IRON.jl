@@ -425,6 +425,32 @@ function emit_call!(kc::KernelContext, block::IR.Block, jblock, inst)
         return emit_convert!(kc, block, ssa, source, from, inst[:type])
     end
 
+    # Object-FIFO lock operations. The FIFO is identified by the *type* of the operand, a
+    # singleton `FifoRef` carrying the symbol name -- there is no MLIR value to look up,
+    # which is why neither of these calls `lookup!` on its first operand.
+    if fn === acquire! || fn === release!
+        # A `FifoRef` is a singleton, so inference reports it as a `Core.Const` rather than
+        # a plain type; widen back to the type the name and port live in.
+        ref = CC.widenconst(IRStructurizer.value_type(jblock, ops[1]))
+        ref <: FifoRef ||
+            error("IRON: $fn expects a FifoRef, got $ref")
+        name, port, T = String(fifo_name(ref)), fifo_port(ref), tiletype(ref)
+        if fn === release!
+            push!(block, objectfifo_release_op(kc.ctx, name, port, 1))
+            return nothing
+        end
+        acq = objectfifo_acquire_op(
+            kc.ctx, name, port, 1, objectfifo_subview_type(kc.ctx, T),
+        )
+        push!(block, acq)
+        access = objectfifo_subview_access_op(
+            kc.ctx, IR.result(acq, 1), 0, memref_type(kc.ctx, T),
+        )
+        push!(block, access)
+        kc.values[ssa] = IR.result(access, 1)
+        return nothing
+    end
+
     if haskey(VECTOR_EMITTERS, fn)
         return emit_vector!(kc, block, jblock, inst, fn, ops, ssa)
     end
@@ -443,7 +469,31 @@ function emit_call!(kc::KernelContext, block::IR.Block, jblock, inst)
     end
 
     entry = get(ARITH_OPS, fn, nothing)
-    entry === nothing && error("IRON: no lowering registered for $fn")
+    if entry === nothing
+        # An ordinary Julia call that Julia's own inliner left standing -- typically the
+        # compute kernel, called from a core body that was compiled by this same path.
+        # Compile its body inline at the call site, binding its parameters to the operands.
+        # This is what lets the code *around* a kernel be Julia too: the kernel stays a
+        # call in the source and stops being one only here.
+        # The use index, not `inst[:type]`, decides whether inlining can work: it is the
+        # honest question ("does anything need a value from this call?") and it is the one
+        # that does not depend on `widen_call_result` being available to keep the inferred
+        # type of an unused call precise. A callee that does return something is caught by
+        # `compile_kernel!`'s own check.
+        haskey(kc.used, ssa) &&
+            error("IRON: no lowering registered for $fn, and its result is used, so it \
+                   cannot be inlined as a nested call")
+        argtypes = Tuple{Any[CC.widenconst(IRStructurizer.value_type(jblock, o)) for o in ops]...}
+        values = IR.Value[]
+        for (o, T) in zip(ops, argtypes.parameters)
+            # Singleton parameters (a FifoRef) carry compile-time information only and
+            # have no MLIR value; the callee reads them off its own argument types.
+            Base.issingletontype(T) && continue
+            push!(values, lookup!(kc, block, o))
+        end
+        compile_kernel!(kc.ctx, block, fn, argtypes, values)
+        return nothing
+    end
     builder, predicate = entry
 
     # Arithmetic is pure, so an unused result means the whole op is dead. These do
@@ -472,6 +522,8 @@ function emit_block!(kc::KernelContext, block::IR.Block, jblock)
         stmt = inst[:stmt]
         if stmt isa IRStructurizer.ForOp
             emit_for!(kc, block, stmt, inst)
+        elseif stmt isa IRStructurizer.LoopOp
+            emit_loop!(kc, block, stmt, inst)
         elseif stmt isa IRStructurizer.IfOp
             emit_if!(kc, block, stmt, inst)
         elseif IRStructurizer.iscall(inst)
@@ -533,6 +585,33 @@ function emit_for!(kc::KernelContext, block::IR.Block, forop, inst)
     return nothing
 end
 
+# A `while true` -- the shape of a core body, which runs for the lifetime of the design and
+# is paced by object-FIFO backpressure rather than by a trip count. IRStructurizer reports
+# it as a `LoopOp`, a cyclic region with no exit test.
+#
+# It is emitted as `scf.for 0:typemax(Int)` rather than `scf.while`, matching the idiom the
+# hand-written designs use and that the rest of the AIE pipeline is known to digest. The
+# induction variable is dead by construction, so the body block gets a leading argument
+# that nothing is bound to.
+function emit_loop!(kc::KernelContext, block::IR.Block, loopop, inst)
+    index = IR.IndexType(; context = kc.ctx)
+    lower = lookup!(kc, block, 0)
+    step = lookup!(kc, block, 1)
+    upper = lookup!(kc, block, typemax(Int))
+    inits = IR.Value[lookup!(kc, block, v) for v in loopop.init_values]
+
+    body, inner = build_body!(kc, loopop.body; extra_args = [gensym(:iv) => index])
+    emit_yield!(inner, body, loopop.body)
+
+    op = scf.for_(
+        lower, upper, step, inits;
+        region = region(body), results = [IR.type(v) for v in inits], location = loc(kc.ctx),
+    )
+    push!(block, op)
+    kc.values[IRStructurizer.SSAValue(inst[:ssa_idx])] = op
+    return nothing
+end
+
 function emit_if!(kc::KernelContext, block::IR.Block, ifop, inst)
     (cond,) = IRStructurizer.operands(ifop)
     cond_value = lookup!(kc, block, cond)
@@ -581,14 +660,25 @@ function compile_kernel!(
     length(results) == 1 ||
         error("IRON: expected exactly one method of $f for $argtypes, found $(length(results))")
     sci, rettype = only(results)
-    rettype === Nothing ||
+    # `Union{}` is a core body that never returns -- a `while true` paced by FIFO
+    # backpressure, which is exactly what a core is supposed to be.
+    rettype === Nothing || rettype === Union{} ||
         error("IRON: kernel $f must return nothing, got $rettype")
 
     entry = first(eachblock(sci))
     kc = KernelContext(ctx, IRStructurizer.uses(entry))
-    # Parameters are referenced as Core.Argument(i+1); Argument(1) is #self#.
-    for (i, arg) in enumerate(args)
-        kc.values[Core.Argument(i + 1)] = arg
+    # Parameters are referenced as Core.Argument(i+1); Argument(1) is #self#. Singleton
+    # parameters -- a `FifoRef`, whose whole content is its type -- lower to no MLIR value,
+    # so they take no entry from `args` and are simply never bound: any use of one is a
+    # call the emitter resolves from the type alone.
+    next = 1
+    for (i, T) in enumerate(argtypes.parameters)
+        Base.issingletontype(T) && continue
+        next <= length(args) ||
+            error("IRON: $f takes $(count(!Base.issingletontype, argtypes.parameters)) \
+                   value parameters but only $(length(args)) MLIR values were supplied")
+        kc.values[Core.Argument(i + 1)] = args[next]
+        next += 1
     end
     emit_block!(kc, block, entry)
     return nothing

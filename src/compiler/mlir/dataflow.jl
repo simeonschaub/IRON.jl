@@ -237,9 +237,6 @@ function emit_runtime_sequence!(ctx::IR.Context, p::Program)
     return runtime_sequence_op(ctx, "sequence", region(body))
 end
 
-# Tile placement here assumes the shape of the reference design: a single worker,
-# with every FIFO running between the host and that one core. Anything else needs a
-# real placement story, so say so plainly instead of emitting a subtly wrong module.
 # Every FIFO must have exactly one producer and at least one consumer, counting both worker
 # endpoints (a compute core) and host transfers (a shim). This is what lets a design span
 # several chained workers with core-to-core FIFOs between them -- a streaming pipeline --

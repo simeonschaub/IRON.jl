@@ -11,6 +11,7 @@ IRStructurizer = "93e32bba-5bb8-402b-805d-ffb066edee93"
 MLIR = "bfde9dd4-8f40-4a1e-be09-1475335e1c92"
 XRT = "4d396880-2e3f-4be1-8c36-e87777010d00"
 mlir_aie_jll = "2db12af9-d9f4-5b21-b666-63f8a71d6323"
+xrt_cxxwrap_jll = "234b3921-e25d-5fa7-97e5-3959209f55eb"
 xrt_jll = "bb401bc5-fb22-5674-bf0e-333823e8805f"
 
 [weakdeps]

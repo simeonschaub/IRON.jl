@@ -275,8 +275,9 @@ end
     end
 
     @testset "unsupported designs are rejected" begin
-        # Two workers: no placement story yet, so this must not silently emit a
-        # module that wires both cores to the same tile.
+        # Two workers writing one FIFO: a FIFO has a single producer endpoint, so this
+        # must be rejected rather than silently emit a module in which both cores write
+        # the same buffer.
         two_workers = let rt = Runtime(), f = ObjectFifo{Buf}("in"), g = ObjectFifo{Buf}("out")
             start!(rt, Worker(add_one, [consumer(f), producer(g)]))
             start!(rt, Worker(add_one, [consumer(f), producer(g)]))
@@ -284,15 +285,16 @@ end
             drain!(rt, consumer(g), 2)
             Program(npu2, rt, [Buf, Buf])
         end
-        @test_throws "exactly one worker" generate_mlir(two_workers)
+        @test_throws "has 2 producers, expected exactly one" generate_mlir(two_workers)
 
-        # A FIFO the host never touches has no shim to attach to.
-        core_to_core = let rt = Runtime(), f = ObjectFifo{Buf}("in"), g = ObjectFifo{Buf}("mid")
+        # A FIFO that is written but never read: no consuming worker and no host
+        # `drain!`, so there is nothing to attach its far end to.
+        dangling = let rt = Runtime(), f = ObjectFifo{Buf}("in"), g = ObjectFifo{Buf}("mid")
             start!(rt, Worker(add_one, [consumer(f), producer(g)]))
             fill!(rt, producer(f), 1)
             Program(npu2, rt, [Buf])
         end
-        @test_throws "core-to-core" generate_mlir(core_to_core)
+        @test_throws "has no consumer" generate_mlir(dangling)
     end
 
     @testset "generated module" begin

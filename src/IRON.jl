@@ -53,6 +53,8 @@ include("device/vec.jl")
 
 include("compiler/mlir/utils.jl")
 include("compiler/mlir/aie.jl")
+# After aie.jl: a FifoRef's port parameter is an `ObjectFifoPort`, defined there.
+include("device/fifo.jl")
 include("compiler/mlir/dataflow.jl")
 include("compiler/interpreter.jl")
 include("compiler/compiler.jl")
