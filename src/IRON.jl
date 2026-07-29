@@ -37,9 +37,13 @@ module IRON
 using MLIR: IR, API
 using MLIR.Dialects: arith, scf, memref, vector
 using IRStructurizer
-using PythonCall
 using Adapt: Adapt, adapt
 using GPUArraysCore: GPUArraysCore, AbstractGPUArray, @allowscalar
+
+import AIE_LLVM_Toolchain_jll
+using mlir_aie_jll: aiecc
+import XRT
+using xrt_jll: xrt_jll
 
 const CC = Core.Compiler
 
@@ -52,6 +56,7 @@ include("compiler/mlir/aie.jl")
 include("compiler/mlir/dataflow.jl")
 include("compiler/interpreter.jl")
 include("compiler/compiler.jl")
+include("compiler/aiecc.jl")
 
 include("array.jl")
 include("runtime.jl")

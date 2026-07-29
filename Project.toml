@@ -1,33 +1,38 @@
 name = "IRON"
 uuid = "d4957cf2-1973-4b5b-8ba8-222f49ed34ed"
-authors = ["Simeon David Schaub <simeon@schaub.rocks> and contributors"]
 version = "1.0.0-DEV"
+authors = ["Simeon David Schaub <simeon@schaub.rocks> and contributors"]
 
 [deps]
+AIE_LLVM_Toolchain_jll = "e1663226-ec2a-58f4-a67b-3f55d12a6125"
 Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
 GPUArraysCore = "46192b85-c4d5-4398-a991-12ede77f4527"
 IRStructurizer = "93e32bba-5bb8-402b-805d-ffb066edee93"
 MLIR = "bfde9dd4-8f40-4a1e-be09-1475335e1c92"
-PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
+XRT = "4d396880-2e3f-4be1-8c36-e87777010d00"
+mlir_aie_jll = "2db12af9-d9f4-5b21-b666-63f8a71d6323"
+xrt_jll = "bb401bc5-fb22-5674-bf0e-333823e8805f"
 
 [weakdeps]
 DLFP8Types = "f4c16678-4a16-415b-82ef-ed337c5d6c7c"
 Microfloats = "31c70f10-a750-4521-b13c-797315ae2933"
 
+[sources]
+XRT = {url = "https://github.com/pc2/XRT.jl.git", rev = "main"}
+
 [extensions]
 IRONDLFP8TypesExt = "DLFP8Types"
 IRONMicrofloatsExt = "Microfloats"
 
-[sources]
-IRStructurizer = {url = "https://github.com/simeonschaub/IRStructurizer.jl", rev = "fix-returnnode-operands"}
-MLIR = {url = "https://github.com/simeonschaub/MLIR.jl", rev = "fix-mark-donate-and-text-printing"}
-
 [compat]
+AIE_LLVM_Toolchain_jll = "21.0.0"
 Adapt = "4"
 DLFP8Types = "0.1"
 GPUArraysCore = "0.2"
 IRStructurizer = "0.6"
-MLIR = "0.2"
+MLIR = "0.3"
 Microfloats = "0.2"
-PythonCall = "0.9"
-julia = "1.11"
+XRT = "0.2"
+julia = "1.10"
+mlir_aie_jll = "1.3"
+xrt_jll = "2.26"

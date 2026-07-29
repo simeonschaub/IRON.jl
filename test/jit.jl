@@ -21,16 +21,16 @@ struct MemRefDescriptor{T, N}
     strides::NTuple{N, Int64}
 end
 
-# memrefs are row-major, Julia arrays are column-major, so `storage` holds the
-# transposed buffer and the descriptor describes it with row-major strides.
+# A `Tile` is column-major and lowers to a memref of the reversed, row-major shape
+# (see `memref_type`), which is byte-for-byte a Julia array's own column-major
+# storage. So the buffer is passed straight through -- no transpose -- and described
+# with the reversed shape and its row-major strides.
 function descriptor(storage::Array{T, N}, dims::NTuple{N, Int}) where {T, N}
-    strides = ntuple(i -> prod(dims[(i + 1):end]; init = 1), N)
+    rdims = reverse(dims)
+    strides = ntuple(i -> prod(rdims[(i + 1):end]; init = 1), N)
     ptr = pointer(storage)
-    return MemRefDescriptor{T, N}(ptr, ptr, 0, Int64.(dims), Int64.(strides))
+    return MemRefDescriptor{T, N}(ptr, ptr, 0, Int64.(rdims), Int64.(strides))
 end
-
-row_major(A::AbstractArray) = collect(permutedims(A, reverse(1:ndims(A))))
-from_row_major(A::AbstractArray) = permutedims(A, reverse(1:ndims(A)))
 
 """
     jit_kernel(f, argtypes) -> Ptr
@@ -92,7 +92,7 @@ logical layout. Outputs are updated in place.
 """
 function run_kernel(@nospecialize(f), @nospecialize(argtypes), arrays::AbstractArray...)
     engine, fptr = jit_kernel(f, argtypes)
-    storage = [row_major(A) for A in arrays]
+    storage = [copy(A) for A in arrays]
     descriptors = [
         Ref(descriptor(s, size(A))) for (s, A) in zip(storage, arrays)
     ]
@@ -111,7 +111,7 @@ function run_kernel(@nospecialize(f), @nospecialize(argtypes), arrays::AbstractA
     end
 
     for (A, s) in zip(arrays, storage)
-        copyto!(A, from_row_major(s))
+        copyto!(A, s)
     end
     return nothing
 end
