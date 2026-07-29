@@ -18,7 +18,7 @@ DLFP8Types = "f4c16678-4a16-415b-82ef-ed337c5d6c7c"
 Microfloats = "31c70f10-a750-4521-b13c-797315ae2933"
 
 [sources]
-XRT = {rev = "main"}
+XRT = {url = "https://github.com/pc2/XRT.jl.git", rev = "main"}
 
 [extensions]
 IRONDLFP8TypesExt = "DLFP8Types"

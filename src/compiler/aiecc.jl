@@ -42,14 +42,14 @@ yet ship).
 designs whose bank-aware allocation silently overlaps buffers (see the README).
 """
 function aiecc_compile(
-    mlir_file::AbstractString;
-    workdir::AbstractString = mktempdir(),
-    xclbin::AbstractString = joinpath(workdir, "design.xclbin"),
-    insts::AbstractString = joinpath(workdir, "insts.bin"),
-    peano::AbstractString = AIE_LLVM_Toolchain_jll.artifact_dir,
-    flags::AbstractVector{<:AbstractString} = String[],
-    verbose::Bool = false,
-)
+        mlir_file::AbstractString;
+        workdir::AbstractString = mktempdir(),
+        xclbin::AbstractString = joinpath(workdir, "design.xclbin"),
+        insts::AbstractString = joinpath(workdir, "insts.bin"),
+        peano::AbstractString = AIE_LLVM_Toolchain_jll.artifact_dir,
+        flags::AbstractVector{<:AbstractString} = String[],
+        verbose::Bool = false,
+    )
     isdir(workdir) || mkpath(workdir)
     args = String[
         "--no-compile-host",        # we only want the device artifacts

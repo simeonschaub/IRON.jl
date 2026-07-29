@@ -129,13 +129,13 @@ written; otherwise it goes under `workdir`. `flags` are passed through to `aiecc
 install used for per-core codegen and linking (see [`aiecc_compile`](@ref)).
 """
 function compile(
-    p::Program;
-    path::Union{Nothing, AbstractString} = nothing,
-    workdir::AbstractString = mktempdir(),
-    peano::AbstractString = AIE_LLVM_Toolchain_jll.artifact_dir,
-    flags::AbstractVector{<:AbstractString} = String[],
-    verbose::Bool = false,
-)
+        p::Program;
+        path::Union{Nothing, AbstractString} = nothing,
+        workdir::AbstractString = mktempdir(),
+        peano::AbstractString = AIE_LLVM_Toolchain_jll.artifact_dir,
+        flags::AbstractVector{<:AbstractString} = String[],
+        verbose::Bool = false,
+    )
     isdir(workdir) || mkpath(workdir)
     mlir = generate_mlir(p)
     mlir_file = path === nothing ? joinpath(workdir, "aie.mlir") : String(path)

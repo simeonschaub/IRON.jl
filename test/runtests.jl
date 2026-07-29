@@ -159,10 +159,10 @@ end
     end
 
     @testset "NPUArray host array" begin
-        # Built over a plain host array with a null buffer handle: this exercises the
-        # Julia-side array interface and the Adapt mapping without an NPU, and without
-        # ever calling into XRT (a null handle makes the syncs no-ops).
-        a = IRON.NPUArray{Int32, 2}(C_NULL, zeros(Int32, 2, 3))
+        # Built over a plain host array with no device buffer behind it: this exercises
+        # the Julia-side array interface and the Adapt mapping without an NPU, and
+        # without ever calling into XRT (a `nothing` buffer makes the syncs no-ops).
+        a = IRON.NPUArray{Int32, 2}(nothing, zeros(Int32, 2, 3))
         @test a isa IRON.AbstractGPUArray{Int32, 2}
         @test eltype(a) === Int32
         @test size(a) == (2, 3)
@@ -174,11 +174,17 @@ end
         @test IRON.kernelconvert(a) === Tile{Int32, Tuple{2, 3}}
 
         # Scalar access is guarded off by default (assertscalar fires before the
-        # buffer is touched); under @allowscalar it forwards to the buffer, which
-        # here is only a placeholder, so it fails past the guard rather than at it.
+        # buffer is touched); under @allowscalar it reaches the host mapping, the
+        # syncs around it being no-ops without a device buffer.
         @test_throws Exception a[1, 1]
         @test hasmethod(getindex, Tuple{typeof(a), Int, Int})
         @test hasmethod(setindex!, Tuple{typeof(a), Int32, Int, Int})
+        @allowscalar begin
+            @test a[1, 1] == 0
+            a[2, 3] = 7
+            @test a[2, 3] == 7
+            a[2, 3] = 0
+        end
 
         # Show renders through a single host copy (the GPUArrays convention), never
         # scalar-indexing the buffer: the compact form matches the host array's, and
