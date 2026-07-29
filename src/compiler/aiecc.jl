@@ -41,6 +41,29 @@ yet ship).
 `--alloc-scheme=basic-sequential`, which forces sequential buffer allocation for
 designs whose bank-aware allocation silently overlaps buffers (see the README).
 """
+# aie-opt's buffer allocator reports a design it could not lay out as a *warning* and then
+# emits a layout anyway, one in which buffers overlap -- so aiecc exits 0 and the design is
+# silently miscompiled. On hardware that looks like the first batch tile being exactly
+# right and every one after it garbage, once whatever aliases the weights has been written,
+# which is indistinguishable from a dataflow bug and very expensive to chase. Surface it.
+const _ALLOC_FAILURES = (
+    "Failed to allocate buffer",
+    "Not all requested buffers fit in the available memory",
+)
+
+function _warn_on_bad_allocation(output::AbstractString)
+    hits = [String(l) for l in eachsplit(output, '\n')
+        if any(p -> occursin(p, l), _ALLOC_FAILURES)]
+    isempty(hits) && return nothing
+    @warn """
+        IRON: aiecc could not place every buffer and emitted an overlapping layout anyway. \
+        The design compiles but will compute wrong results. Bank-aware allocation (the \
+        default) requires each buffer to fit inside one memory bank; pass \
+        `flags = ["--alloc-scheme=basic-sequential"]` to pack them instead.""" *
+        "\n" * join(hits, "\n")
+    return nothing
+end
+
 function aiecc_compile(
     mlir_file::AbstractString;
     workdir::AbstractString = mktempdir(),
@@ -77,11 +100,13 @@ function aiecc_compile(
     else
         io = IOBuffer()
         proc = run(pipeline(ignorestatus(cmd); stdout = io, stderr = io); wait = true)
+        output = String(take!(io))
         if !success(proc)
-            write(stderr, take!(io))
+            write(stderr, output)
             error("IRON: aiecc failed (exit code $(proc.exitcode)). \
                 Re-run with `verbose = true` for the full toolchain output.")
         end
+        _warn_on_bad_allocation(output)
     end
     # aiecc can exit 0 having generated the NPU instructions but no xclbin -- a
     # failed place/route or core compile that it does not propagate to its exit

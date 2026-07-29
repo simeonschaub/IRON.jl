@@ -63,6 +63,18 @@ end
 # inferred without the overlay.
 struct IRONCacheToken end
 
+# Inference widens the result type of a call whose value is unused to `Any`: nothing
+# downstream of *inference* needs it, so computing it precisely is wasted work. A kernel
+# compiler is downstream of inference, though, and it does need it -- a core body is
+# almost entirely calls made for their effects, and every one of them (a `release!`, a
+# kernel invoked on tiles it writes) has an unused result. Without this the emitter cannot
+# tell a void call it should inline from one it has no lowering for.
+@static if isdefined(CC, :widen_call_result)
+    CC.widen_call_result(
+        ::IRONInterpreter, ::CC.StmtInfo, ::CC.CallInferenceState, ::CC.AbsIntState,
+    ) = false
+end
+
 @static if !isdefined(CC, :InferenceCache)
     CC.lock_mi_inference(::IRONInterpreter, ::Core.MethodInstance) = nothing
     CC.unlock_mi_inference(::IRONInterpreter, ::Core.MethodInstance) = nothing

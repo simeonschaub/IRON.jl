@@ -2,6 +2,9 @@
 BFloat16s = "ab4f0b2a-ad5b-11e8-123f-65d77653426b"
 DLFP8Types = "f4c16678-4a16-415b-82ef-ed337c5d6c7c"
 IRON = "d4957cf2-1973-4b5b-8ba8-222f49ed34ed"
+XRT = "4d396880-2e3f-4be1-8c36-e87777010d00"
+mlir_aie_jll = "2db12af9-d9f4-5b21-b666-63f8a71d6323"
+xrt_cxxwrap_jll = "234b3921-e25d-5fa7-97e5-3959209f55eb"
 
 [source.IRON]
 path = "../"
