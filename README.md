@@ -40,9 +40,8 @@ program = Program(npu2, rt, [Buf, Buf])
 println(generate_mlir(program))
 ```
 
-See `examples/add_one.jl` for the same design end to end. It is the Julia port of
-the Python IRON vector-increment example, and produces the module in
-`generic.mlir`.
+This design is the Julia port of the Python IRON vector-increment example, and
+produces the module in `generic.mlir`.
 
 ## Running on hardware
 
@@ -75,9 +74,8 @@ when bank-aware *reports* failure. For a design with several object FIFOs on one
 core it does not report failure -- it produces an allocation whose buffers
 overlap, and the design runs, and returns an output tile holding an input's
 bytes. Every matrix multiply under `programming_examples/` passes this flag, as
-does `examples/matmul.jl`. If a design compiles and runs but returns data that
-looks like one of its inputs, try this first; `examples/diagnose.jl` runs the
-same matmul with and without it.
+does `examples/gemm.jl`. If a design compiles and runs but returns data that
+looks like one of its inputs, try this first.
 
 ## How kernels are compiled
 
@@ -100,8 +98,8 @@ call with no registered lowering is an error rather than a silently wrong kernel
 
 ## Element types
 
-A kernel is generic in its element type: `examples/matmul.jl` writes one
-`matmul!` and compiles it for each of
+A kernel is generic in its element type: one `matmul!` source compiles to each
+of
 
 | Julia | MLIR | multiply-accumulate |
 |---|---|---|
@@ -122,7 +120,7 @@ the gap is wide enough to be worth stating. `_MM_COMBOS` in
 multiplies -- `(i8,i8) (i8,i16) (i8,i32) (i16,i16) (i16,i32) (bf16,bf16)
 (bf16,f32)` -- and f32 appears only as an accumulator, never as an operand.
 
-Measured on an NPU2, with `examples/diagnose.jl`:
+Measured on an NPU2:
 
 | kernel | result |
 |---|---|
@@ -134,8 +132,7 @@ Measured on an NPU2, with `examples/diagnose.jl`:
 Moving floats is fine; multiplying them scalar-wise on the core is not, and it
 fails silently rather than refusing to compile. The bf16 case fails for the same
 reason -- widening on load is one `arith.extf`, but the accumulate is still scalar
-f32. So a scalar kernel that computes should use integers, which is why
-`examples/matmul.jl` runs the i32 design.
+f32. So a scalar kernel that computes should use integers.
 
 Float throughput lives in the vector unit, and that is reachable -- see below.
 
@@ -149,7 +146,7 @@ the standard `vector` dialect; nothing here emits `aievec` directly:
 vector.fma  ->  aievec.mac_elem  ->  the MAC intrinsic aie::mmul uses
 ```
 
-A kernel says that with `Vec{N,T}` (`examples/matmul_vectorized.jl`):
+A kernel says that with `Vec{N,T}`:
 
 ```julia
 for i in 1:M
@@ -164,8 +161,7 @@ for i in 1:M
 end
 ```
 
-Measured on an NPU2 with `examples/matmul_vectorized.jl`, `BFloat16 -> Float32`
-**passes**: a pure-Julia matmul running on the AIE vector unit, through the same
+Measured on an NPU2, `BFloat16 -> Float32` **passes**: a pure-Julia matmul running on the AIE vector unit, through the same
 `aievec.mac_elem` the C++ kernels reach via `aie::mmul`. That is the one
 combination the MAC is built out of. `Int16 -> Int32` stops in peano (`unable to
 legalize <16 x s32> G_MUL` -- the MAC widens i16 internally, so there is no i32
