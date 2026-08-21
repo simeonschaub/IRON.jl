@@ -1,8 +1,8 @@
 # This file is machine-generated - editing it directly is not advised
 
-julia_version = "1.12.6"
+julia_version = "1.12.7"
 manifest_format = "2.0"
-project_hash = "04c13ba26d7d383a6115070382dc5cf4c28993cd"
+project_hash = "e180f899a30cab4e652fddac6e3291d001a12a80"
 
 [[deps.Adapt]]
 deps = ["LinearAlgebra"]
@@ -46,7 +46,7 @@ version = "0.4.2"
 [[deps.CompilerSupportLibraries_jll]]
 deps = ["Artifacts", "Libdl"]
 uuid = "e66e0078-7015-5450-92f7-15fbd957f2ae"
-version = "1.3.0+1"
+version = "1.3.1+2"
 
 [[deps.DLFP8Types]]
 git-tree-sha1 = "422996f4ddf0ed17a9a3b729347fcbf38fae80b2"
@@ -111,15 +111,17 @@ version = "1.11.0"
 
 [[deps.Microfloats]]
 deps = ["BFloat16s", "BitPacking", "Random", "Republic"]
-git-tree-sha1 = "d7f85e3ed1c0f35dbf258a45502e28ca1ce255ac"
+git-tree-sha1 = "c7eae7fa8347e6f0ffdcdb85bdcc4c6adf368aa1"
 uuid = "31c70f10-a750-4521-b13c-797315ae2933"
-version = "0.2.3"
+version = "0.2.5"
 
     [deps.Microfloats.extensions]
     CUDACoreExt = "CUDACore"
+    cuDNNExt = "cuDNN"
 
     [deps.Microfloats.weakdeps]
     CUDACore = "bd0ed864-bdfe-4181-a5ed-ce625a5fdea2"
+    cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
 
 [[deps.OpenBLAS_jll]]
 deps = ["Artifacts", "CompilerSupportLibraries_jll", "Libdl"]
